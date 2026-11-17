@@ -1,7 +1,7 @@
 import tree_sitter_zscript as tszscript
 from lsprotocol import types
 from pygls.lsp.server import LanguageServer
-from tree_sitter import Language, Parser
+from tree_sitter import Language, Node, Parser
 
 ZSCRIPT_LANGUAGE = Language(tszscript.language())
 parser = Parser(ZSCRIPT_LANGUAGE)
@@ -9,11 +9,11 @@ parser = Parser(ZSCRIPT_LANGUAGE)
 server = LanguageServer("zscript-lsp", "0.1.0")
 
 
-def validate_document(ls: LanguageServer, uri: str, source: str):
+def validate_document(ls: LanguageServer, uri: str, source: str) -> None:
     tree = parser.parse(bytes(source, "utf8"))
     diagnostics = []
 
-    def walk(node):
+    def walk(node: Node) -> None:
         if node.type == "ERROR" or node.is_missing:
             diagnostics.append(
                 types.Diagnostic(
@@ -41,19 +41,19 @@ def validate_document(ls: LanguageServer, uri: str, source: str):
 
 
 @server.feature(types.TEXT_DOCUMENT_DID_OPEN)
-def did_open(ls: LanguageServer, params: types.DidOpenTextDocumentParams):
+def did_open(ls: LanguageServer, params: types.DidOpenTextDocumentParams) -> None:
     doc = ls.workspace.get_text_document(params.text_document.uri)
     validate_document(ls, doc.uri, doc.source)
 
 
 @server.feature(types.TEXT_DOCUMENT_DID_CHANGE)
-def did_change(ls: LanguageServer, params: types.DidChangeTextDocumentParams):
+def did_change(ls: LanguageServer, params: types.DidChangeTextDocumentParams) -> None:
     doc = ls.workspace.get_text_document(params.text_document.uri)
     validate_document(ls, doc.uri, doc.source)
 
 
 @server.feature(types.TEXT_DOCUMENT_COMPLETION)
-def completions(params: types.CompletionParams):
+def completions(params: types.CompletionParams) -> types.CompletionList:
     keywords = [
         "class",
         "struct",
@@ -71,10 +71,11 @@ def completions(params: types.CompletionParams):
         ],
     )
 
+
 @server.feature(types.WORKSPACE_DID_CHANGE_CONFIGURATION)
 def did_change_configuration(
     ls: LanguageServer, params: types.DidChangeConfigurationParams
-):
+) -> None:
     pass
 
 

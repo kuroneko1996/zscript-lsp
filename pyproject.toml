@@ -25,3 +25,8 @@ package = false
 
 [tool.uv.sources]
 tree-sitter-zscript = { path = "F:/projects/zscript-grammar", editable = true }
+
+[dependency-groups]
+dev = [
+    "mypy>=2.4.1",
+]
