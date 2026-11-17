@@ -1,0 +1,27 @@
+[project]
+name = "zscript-lsp"
+version = "0.1.0"
+description = "ZScript language server"
+readme = "README.md"
+authors = [
+    { name = "kuroneko1996", email = "20803349+kuroneko1996@users.noreply.github.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "pygls>=2.1.1",
+    "tree-sitter>=0.26.1",
+    "tree-sitter-zscript",
+]
+
+[project.scripts]
+server = "server"
+
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+tree-sitter-zscript = { path = "F:/projects/zscript-grammar", editable = true }
