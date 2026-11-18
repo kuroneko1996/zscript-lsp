@@ -42,11 +42,30 @@ def extract_signature(node: Node, source: str) -> str:
         if child.type in ("block", ";"):
             end_byte = child.start_byte
             break
-    return " ".join(source[node.start_byte : end_byte].split())
+
+    sig = " ".join(source[node.start_byte : end_byte].split())
+
+    if node.type in ("method_declaration", "variable_declaration"):
+        sig += ";"
+        # Searches for a parent class or structure in which to wrap the signature to form valid ZScript.
+        parent = node.parent
+        while parent:
+            if parent.type in ("class_definition", "struct_definition"):
+                kind = "class" if parent.type == "class_definition" else "struct"
+                name_node = parent.child_by_field_name("name")
+                owner_name = (
+                    source[name_node.start_byte : name_node.end_byte]
+                    if name_node
+                    else "Object"
+                )
+                return f"{kind} {owner_name} {{\n    {sig}\n}}"
+            parent = parent.parent
+
+    return sig
 
 
 def index_source(uri: str, source: str) -> list[types.Diagnostic]:
-    """Парсит файл, собирает диагностику ошибок и обновляет индекс символов."""
+    """Parses the file, collects error diagnostics, and updates the symbol index."""
     # Clearing old symbols from this file before reindexing
     old_names = file_symbols.get(uri, set())
     for name in old_names:
