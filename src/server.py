@@ -21,6 +21,7 @@ class SymbolInfo:
     location: types.Location
     signature: str
     owner: str | None = None
+    type_name: str | None = None
 
 
 # Global index: { "lower_case_name": [SymbolInfo, ...] }
@@ -154,6 +155,12 @@ def index_source(
         key = orig_name.lower()
         owner_info = find_owner_node(decl_node)
         owner_name = owner_info[1] if owner_info else None
+        type_node = decl_node.child_by_field_name("type")
+        type_name = (
+            source[type_node.start_byte : type_node.end_byte].strip("@").lower()
+            if type_node
+            else None
+        )
 
         info = SymbolInfo(
             orig_name=orig_name,
@@ -162,6 +169,7 @@ def index_source(
             location=types.Location(uri=uri, range=node_to_range(name_node)),
             signature=extract_signature(decl_node, source),
             owner=owner_name,
+            type_name=type_name,
         )
 
         symbol_index.setdefault(key, []).append(info)
@@ -263,6 +271,170 @@ def get_members_with_inheritance(class_key: str) -> list[SymbolInfo]:
     return result
 
 
+def infer_rhs_type(
+    expr_node: Node, source: str, current_class: str | None
+) -> str | None:
+    """Detects right side for an assignment (e.g for let x = ...)."""
+
+    if expr_node.type not in ("function_expression", "typecast_expression"):
+        return None
+
+    fn_node = expr_node.child_by_field_name(
+        "function"
+    ) or expr_node.child_by_field_name("type")
+    if not fn_node:
+        return None
+    fn_name = source[fn_node.start_byte : fn_node.end_byte].lower()
+
+    # 1. new("MyLibrary") or MyLibrary(arg)
+    if fn_name == "new":
+        args = expr_node.children_by_field_name(
+            "argument"
+        ) or expr_node.children_by_field_name("target")
+        for arg in args:
+            raw = source[arg.start_byte : arg.end_byte].strip("'").strip('"').lower()
+            if raw in class_members or raw in symbol_index:
+                return raw
+    elif fn_name in class_members or fn_name in symbol_index:
+        return fn_name
+
+    # 2. Method Call: MyLibrary.GetInstance() или obj.GetItem()
+    if fn_node.type == "member_access_expression":
+        obj_node = fn_node.children[0] if fn_node.children else None
+        mem_node = fn_node.child_by_field_name("member")
+        if obj_node and mem_node:
+            obj_name = source[obj_node.start_byte : obj_node.end_byte].lower()
+            mem_name = source[mem_node.start_byte : mem_node.end_byte].lower()
+            owner_type = current_class if obj_name == "self" else obj_name
+            for m in get_members_with_inheritance(owner_type or ""):
+                if m.orig_name.lower() == mem_name and m.type_name:
+                    return m.type_name
+
+    return None
+
+
+def find_enclosing_by_line(root: Node, line: int) -> tuple[Node | None, Node | None]:
+    """Finds the nearest method and class/struct based on the line number (resilient to ERROR nodes in the input)."""
+    found_method: Node | None = None
+    found_owner: Node | None = None
+
+    def walk(n: Node) -> None:
+        nonlocal found_method, found_owner
+        if n.start_point.row <= line <= n.end_point.row:
+            if n.type in ("class_definition", "struct_definition"):
+                found_owner = n
+            elif n.type == "method_declaration":
+                found_method = n
+            for ch in n.children:
+                walk(ch)
+
+    walk(root)
+    return found_method, found_owner
+
+
+def resolve_identifier_type(
+    ident_lower: str,
+    source: str,
+    point: tuple[int, int],
+) -> str | None:
+    """Returns the name of the class/struct (in lowercase) for the identifier at the cursor position."""
+    # 1. The identifier itself is a known class/struct (MyLibrary.)
+    if ident_lower in class_members or ident_lower in symbol_index:
+        for entry in symbol_index.get(ident_lower, []):
+            if entry.kind in (
+                types.CompletionItemKind.Class,
+                types.CompletionItemKind.Struct,
+            ):
+                return ident_lower
+
+    tree = parser.parse(bytes(source, "utf-8"))
+    # Find the current method and the current class/struct surrounding the cursor
+    current_method, owner_node = find_enclosing_by_line(tree.root_node, point[0])
+
+    current_class: str | None = None
+
+    if owner_node:
+        name_node = owner_node.child_by_field_name("name")
+        if name_node:
+            current_class = source[name_node.start_byte : name_node.end_byte].lower()
+
+    # 2. Process self and super
+    if ident_lower == "self":
+        return current_class
+    if ident_lower == "super" and current_class:
+        return class_parents.get(current_class)
+
+    # 3. Searching among the parameters and local variables of the current method
+    if current_method:
+        # 3a. Method parameters
+        param_list = next(
+            (c for c in current_method.children if c.type == "parameter_list"), None
+        )
+        if param_list:
+            p_types = param_list.children_by_field_name("type")
+            p_names = param_list.children_by_field_name("name")
+            for t_node, n_node in zip(p_types, p_names):
+                if source[n_node.start_byte : n_node.end_byte].lower() == ident_lower:
+                    return (
+                        source[t_node.start_byte : t_node.end_byte].strip("@").lower()
+                    )
+
+        # 3b. Local variables inside the method (including 'let')
+        def scan_locals(n: Node) -> str | None:
+            if n.type == "declaration_statement":
+                t_node = n.child_by_field_name("type")
+                if t_node:
+                    t_str = (
+                        source[t_node.start_byte : t_node.end_byte].strip("@").lower()
+                    )
+                    for child in n.children:
+                        if (
+                            child.type == "identifier"
+                            and source[child.start_byte : child.end_byte].lower()
+                            == ident_lower
+                        ):
+                            return t_str
+                        if child.type == "assignment_expression":
+                            left = child.child_by_field_name("left")
+                            if (
+                                left
+                                and source[left.start_byte : left.end_byte].lower()
+                                == ident_lower
+                            ):
+                                return t_str
+                else:
+                    # let x = ...;
+                    for child in n.children:
+                        if child.type == "assignment_expression":
+                            left = child.child_by_field_name("left")
+                            right = child.child_by_field_name("right")
+                            if not left or not right:
+                                continue
+                            if (
+                                source[left.start_byte : left.end_byte].lower()
+                                == ident_lower
+                            ):
+                                return infer_rhs_type(right, source, current_class)
+
+            for ch in n.children:
+                res = scan_locals(ch)
+                if res:
+                    return res
+            return None
+
+        local_type = scan_locals(current_method)
+        if local_type:
+            return local_type
+
+    # 4. Searching among the fields of the current class and its parents
+    if current_class:
+        for member in get_members_with_inheritance(current_class):
+            if member.orig_name.lower() == ident_lower and member.type_name:
+                return member.type_name
+
+    return None
+
+
 @server.feature(types.INITIALIZED)
 def on_initialized(ls: LanguageServer, params: types.InitializedParams) -> None:
     visited_uris: set[str] = set()
@@ -343,7 +515,7 @@ def completions(
     items = []
 
     doc = ls.workspace.get_text_document(params.text_document.uri)
-    current_line = doc.lines[params.position.line].strip()
+    current_line = doc.lines[params.position.line][: params.position.character]
 
     if "." in current_line:
         before_dot = current_line.rsplit(".", 1)[0].rstrip()
@@ -355,9 +527,13 @@ def completions(
                 break
         owner_ident = "".join(reversed(ident_chars)).lower()
         if owner_ident:
-            members = get_members_with_inheritance(owner_ident)
+            point = (params.position.line, params.position.character)
+            resolved_type = resolve_identifier_type(owner_ident, doc.source, point)
+            target_class = resolved_type or owner_ident
+            members = get_members_with_inheritance(target_class)
             for m in members:
-                signature = m.signature.splitlines()[1].strip()
+                sig_lines = m.signature.splitlines()
+                signature = sig_lines[1].strip() if len(sig_lines) > 1 else m.signature
                 items.append(
                     types.CompletionItem(
                         label=m.orig_name,
