@@ -271,6 +271,7 @@ def on_initialized(ls: LanguageServer, params: types.InitializedParams) -> None:
         if not root_path.exists():
             continue
 
+        # Check for root file
         for root_entry in (
             "zscript.zs",
             "zscript.zsc",
@@ -291,16 +292,15 @@ def on_initialized(ls: LanguageServer, params: types.InitializedParams) -> None:
                         )
                     except OSError:
                         pass
-                    for ext in (".zs", ".zsc", "*.zscript"):
-                        for file_path in root_path.rglob(ext):
-                            file_uri = file_path.as_uri()
-                            if file_uri not in visited_uris:
-                                try:
-                                    text = file_path.read_text(
-                                        encoding="utf-8", errors="ignore"
-                                    )
-                                except OSError:
-                                    pass
+        # Check others
+        for ext in (".zs", ".zsc", "*.zscript"):
+            for file_path in root_path.rglob(ext):
+                file_uri = file_path.as_uri()
+                if file_uri not in visited_uris:
+                    try:
+                        text = file_path.read_text(encoding="utf-8", errors="ignore")
+                    except OSError:
+                        pass
 
 
 @server.feature(types.TEXT_DOCUMENT_DID_OPEN)
@@ -341,9 +341,6 @@ def completions(
         "foreach",
     ]
     items = []
-    for symbol_info in symbol_index.values():
-        unique_names = list(dict.fromkeys(e.orig_name for e in symbol_info))
-        items.append(types.CompletionItem(label=unique_names[0], kind=types.CompletionItemKind.Keyword))
 
     doc = ls.workspace.get_text_document(params.text_document.uri)
     current_line = doc.lines[params.position.line].strip()
@@ -369,10 +366,26 @@ def completions(
                     )
                 )
     else:
-        items = [
-            types.CompletionItem(label=kw, kind=types.CompletionItemKind.Keyword)
-            for kw in keywords
-        ]
+        for kw in keywords:
+            items.append(
+                types.CompletionItem(label=kw, kind=types.CompletionItemKind.Keyword)
+            )
+        allowed_global_kinds = {
+            types.CompletionItemKind.Class,
+            types.CompletionItemKind.Struct,
+            types.CompletionItemKind.Enum,
+        }
+        for entries in symbol_index.values():
+            for entry in entries:
+                if entry.kind in allowed_global_kinds:
+                    items.append(
+                        types.CompletionItem(
+                            label=entry.orig_name,
+                            kind=entry.kind,
+                            detail=entry.signature,
+                        )
+                    )
+                    break
 
     return types.CompletionList(is_incomplete=False, items=items)
 
