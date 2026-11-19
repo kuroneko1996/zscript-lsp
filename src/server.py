@@ -41,7 +41,7 @@ def uri_to_path(uri: str) -> Path:
     parsed = urlparse(uri)
     path_str = unquote(parsed.path)
     # Remove first slash symbol on Windows
-    if len(path_str) >= 3 and path_str == "/" and path_str == ":":
+    if len(path_str) >= 3 and path_str[0] == "/" and path_str[2] == ":":
         path_str = path_str[1:]
     return Path(path_str)
 
@@ -67,18 +67,22 @@ def get_workspace_root_for_uri(ls: LanguageServer, uri: str) -> Path | None:
 
 
 def resolve_include_path(
-    root_path: Path, current_uri: str, inc_str: str
+    root_path: Path | None, current_uri: str, inc_str: str
 ) -> Path | None:
     clean_rel = inc_str.strip('"').strip("'").replace("\\", "/").strip()
     if not clean_rel:
         return None
-    candidate_root = (root_path / clean_rel).resolve()
-    if candidate_root.is_file():
-        return candidate_root
-    current_dir = uri_to_path(current_uri).parent
-    candidate_rel = (current_dir / clean_rel).resolve()
-    if candidate_rel.is_file():
-        return candidate_rel
+
+    candidates: list[Path] = []
+
+    if root_path:
+        candidates.append((root_path / clean_rel).resolve())
+    if current_uri.startswith("file://"):
+        candidates.append((uri_to_path(current_uri).parent / clean_rel).resolve())
+
+    for cand in candidates:
+        if cand.is_file():
+            return cand
     return None
 
 
@@ -194,7 +198,7 @@ def index_source(
 
         if node.type == "include_definition":
             path_node = node.child_by_field_name("path")
-            if path_node and workspace_root:
+            if path_node:
                 inc_text = source[path_node.start_byte : path_node.end_byte]
                 target_file = resolve_include_path(workspace_root, uri, inc_text)
                 if target_file:
@@ -248,7 +252,8 @@ def index_source(
 
 
 def validate_and_index(ls: LanguageServer, uri: str, source: str) -> None:
-    diagnostics = index_source(uri, source)
+    root = get_workspace_root_for_uri(ls, uri)
+    diagnostics = index_source(uri, source, workspace_root=root)
     ls.text_document_publish_diagnostics(
         types.PublishDiagnosticsParams(uri=uri, diagnostics=diagnostics)
     )
@@ -474,7 +479,7 @@ def on_initialized(ls: LanguageServer, params: types.InitializedParams) -> None:
                     except OSError:
                         pass
         # Check others
-        for ext in (".zs", ".zsc", "*.zscript"):
+        for ext in ("*.zs", "*.zsc", "*.zscript"):
             for file_path in root_path.rglob(ext):
                 file_uri = file_path.as_uri()
                 if file_uri not in visited_uris:
@@ -571,8 +576,7 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> types.Hover | None:
     if not entries:
         return None
     unique_sigs = list(dict.fromkeys(e.signature for e in entries))
-    markdown = "\n\n---\n\n".join(f"zscript\n{sig}\n" for sig in unique_sigs)
-    markdown = "```" + markdown + "```"
+    markdown = "\n\n---\n\n".join(f"```zscript\n{sig}\n```" for sig in unique_sigs)
     return types.Hover(
         contents=types.MarkupContent(
             kind=types.MarkupKind.Markdown,
