@@ -28,7 +28,7 @@ cd zscript-lsp
 uv sync
 ```
 
-## Configuration (Zed)
+## Configuration (Zed, work in progress)
 
 To index built-in engine classes (such as `Actor`, `Weapon`, or `PlayerPawn`), specify the path to your `uzdoom.pk3` or `gzdoom.pk3` archive in your editor settings (`settings.json`):
 
