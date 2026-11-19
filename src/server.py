@@ -535,9 +535,20 @@ def is_ignored_identifier(node: Node) -> bool:
 
 
 def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
-    """Последовательно проверяет идентификаторы с учётом порядка объявления и блочных областей видимости."""
+    """Последовательно проверяет идентификаторы и члены классов после точки с учётом типов и областей видимости."""
     tree = parser.parse(bytes(source, "utf-8"))
     extra_diagnostics: list[types.Diagnostic] = []
+
+    def is_known_class_or_struct(type_lower: str) -> bool:
+        if type_lower in class_members:
+            return True
+        for entry in symbol_index.get(type_lower, []):
+            if entry.kind in (
+                types.CompletionItemKind.Class,
+                types.CompletionItemKind.Struct,
+            ):
+                return True
+        return False
 
     def walk_tree(node: Node, current_class: str | None = None) -> None:
         if node.type in ("class_definition", "struct_definition"):
@@ -556,55 +567,131 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
             if not body:
                 return
 
-            # Базовый scope: встроенные имена + глобальные символы + члены класса + параметры метода
-            base_scope = set(builtin_identifiers)
-            base_scope.update(symbol_index.keys())
+            # Базовый scope: { "имя_в_нижнем_регистре": "тип_в_нижнем_регистре_или_None" }
+            base_scope: dict[str, str | None] = {
+                name: None for name in builtin_identifiers
+            }
+            for sym_key, entries in symbol_index.items():
+                first = entries[0]
+                if first.kind in (
+                    types.CompletionItemKind.Class,
+                    types.CompletionItemKind.Struct,
+                ):
+                    base_scope[sym_key] = sym_key
+                else:
+                    base_scope[sym_key] = first.type_name
+
             if current_class:
+                base_scope["self"] = current_class
+                base_scope["super"] = class_parents.get(current_class)
                 for m in get_members_with_inheritance(current_class):
-                    base_scope.add(m.orig_name.lower())
+                    base_scope[m.orig_name.lower()] = m.type_name
 
             param_list = next(
                 (c for c in node.children if c.type == "parameter_list"), None
             )
             if param_list:
-                for n_node in param_list.children_by_field_name("name"):
-                    base_scope.add(source[n_node.start_byte : n_node.end_byte].lower())
+                p_types = param_list.children_by_field_name("type")
+                p_names = param_list.children_by_field_name("name")
+                for t_node, n_node in zip(p_types, p_names):
+                    p_name = source[n_node.start_byte : n_node.end_byte].lower()
+                    p_type = (
+                        source[t_node.start_byte : t_node.end_byte].strip("@").lower()
+                    )
+                    base_scope[p_name] = p_type
 
-            scope_stack: list[set[str]] = [base_scope]
+            scope_stack: list[dict[str, str | None]] = [base_scope]
 
-            def is_declared(name_lower: str) -> bool:
-                return any(name_lower in scope for scope in reversed(scope_stack))
+            def lookup_var(name_lower: str) -> tuple[bool, str | None]:
+                for scope in reversed(scope_stack):
+                    if name_lower in scope:
+                        return True, scope[name_lower]
+                return False, None
+
+            def resolve_node_type(expr: Node | None) -> str | None:
+                """Определяет тип выражения (идентификатора, вызова метода, поля или цепочки точек)."""
+                if not expr:
+                    return None
+
+                if expr.type == "identifier":
+                    _, var_type = lookup_var(
+                        source[expr.start_byte : expr.end_byte].lower()
+                    )
+                    return var_type
+
+                if expr.type in ("function_expression", "typecast_expression"):
+                    fn_node = expr.child_by_field_name(
+                        "function"
+                    ) or expr.child_by_field_name("type")
+                    if not fn_node:
+                        return None
+                    if fn_node.type == "identifier":
+                        fn_name = source[fn_node.start_byte : fn_node.end_byte].lower()
+                        if fn_name == "new":
+                            args = expr.children_by_field_name(
+                                "argument"
+                            ) or expr.children_by_field_name("target")
+                            for arg in args:
+                                raw = (
+                                    source[arg.start_byte : arg.end_byte]
+                                    .strip("'")
+                                    .strip('"')
+                                    .lower()
+                                )
+                                if is_known_class_or_struct(raw):
+                                    return raw
+                        elif is_known_class_or_struct(fn_name):
+                            return fn_name
+                        else:
+                            _, ret_type = lookup_var(fn_name)
+                            return ret_type
+                    elif fn_node.type == "member_access_expression":
+                        return resolve_node_type(fn_node)
+
+                if expr.type == "member_access_expression" and expr.children:
+                    obj_node = expr.children[0]
+                    mem_node = expr.child_by_field_name("member")
+                    owner_type = resolve_node_type(obj_node)
+                    if owner_type and mem_node:
+                        mem_name = source[
+                            mem_node.start_byte : mem_node.end_byte
+                        ].lower()
+                        for m in get_members_with_inheritance(owner_type):
+                            if m.orig_name.lower() == mem_name:
+                                return m.type_name
+
+                return None
 
             def check_node(n: Node) -> None:
-                # 1. Вложенный блок { ... } создаёт локальную область видимости
+                # 1. Вложенный блок { ... }
                 if n.type == "block":
-                    scope_stack.append(set())
+                    scope_stack.append({})
                     for ch in n.children:
                         check_node(ch)
                     scope_stack.pop()
                     return
 
-                # 2. Цикл for (int i = 0; ...) изолирует счётчик i внутри цикла
+                # 2. Цикл for
                 if n.type == "for_statement":
-                    scope_stack.append(set())
+                    scope_stack.append({})
                     for ch in n.children:
                         check_node(ch)
                     scope_stack.pop()
                     return
 
-                # 3. Цикл foreach (k, v : list) сначала проверяет list, затем регистрирует k и v
+                # 3. Цикл foreach
                 if n.type == "foreach_statement":
                     right_node = n.child_by_field_name("right")
                     if right_node:
                         check_node(right_node)
 
-                    scope_stack.append(set())
+                    scope_stack.append({})
                     for field_name in ("left", "value"):
                         f_node = n.child_by_field_name(field_name)
                         if f_node and f_node.type == "identifier":
-                            scope_stack[-1].add(
+                            scope_stack[-1][
                                 source[f_node.start_byte : f_node.end_byte].lower()
-                            )
+                            ] = None
 
                     body_node = n.child_by_field_name("body")
                     if body_node:
@@ -612,25 +699,32 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                     scope_stack.pop()
                     return
 
-                # 4. Объявление переменной: сначала проверяем правую часть, потом добавляем имя в текущий scope
+                # 4. Объявление переменной (с явным типом или через let)
                 if n.type == "declaration_statement":
+                    t_node = n.child_by_field_name("type")
+                    explicit_type = (
+                        source[t_node.start_byte : t_node.end_byte].strip("@").lower()
+                        if t_node
+                        else None
+                    )
                     for child in n.children:
                         if child.type == "identifier":
-                            scope_stack[-1].add(
+                            scope_stack[-1][
                                 source[child.start_byte : child.end_byte].lower()
-                            )
+                            ] = explicit_type
                         elif child.type == "assignment_expression":
                             right = child.child_by_field_name("right")
                             if right:
                                 check_node(right)
                             left = child.child_by_field_name("left")
                             if left and left.type == "identifier":
-                                scope_stack[-1].add(
+                                var_type = explicit_type or resolve_node_type(right)
+                                scope_stack[-1][
                                     source[left.start_byte : left.end_byte].lower()
-                                )
+                                ] = var_type
                     return
 
-                # 5. Локальная константа внутри метода
+                # 5. Локальная константа
                 if n.type in ("const_definition", "const_array_definition"):
                     val_node = n.child_by_field_name("value") or n.child_by_field_name(
                         "contents"
@@ -638,16 +732,61 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                     if val_node:
                         check_node(val_node)
                     name_node = n.child_by_field_name("name")
+                    t_node = n.child_by_field_name("type")
+                    c_type = (
+                        source[t_node.start_byte : t_node.end_byte].strip("@").lower()
+                        if t_node
+                        else None
+                    )
                     if name_node:
-                        scope_stack[-1].add(
+                        scope_stack[-1][
                             source[name_node.start_byte : name_node.end_byte].lower()
-                        )
+                        ] = c_type
                     return
 
-                # 6. Обычный идентификатор в выражении
+                # 6. Обращение через точку: obj.member
+                if n.type == "member_access_expression" and n.children:
+                    obj_node = n.children[0]
+                    check_node(obj_node)
+
+                    mem_node = n.child_by_field_name("member")
+                    if mem_node:
+                        # Если справа вложена ещё одна точка (a.b.c), берём левый идентификатор b
+                        target_mem = (
+                            mem_node.children[0]
+                            if mem_node.type == "member_access_expression"
+                            and mem_node.children
+                            else mem_node
+                        )
+                        owner_type = resolve_node_type(obj_node)
+                        if (
+                            owner_type
+                            and is_known_class_or_struct(owner_type)
+                            and target_mem.type == "identifier"
+                        ):
+                            orig_mem = source[
+                                target_mem.start_byte : target_mem.end_byte
+                            ]
+                            mem_lower = orig_mem.lower()
+                            members = get_members_with_inheritance(owner_type)
+                            if not any(
+                                m.orig_name.lower() == mem_lower for m in members
+                            ):
+                                extra_diagnostics.append(
+                                    types.Diagnostic(
+                                        range=node_to_range(target_mem),
+                                        message=f"Unknown member '{orig_mem}' on type '{owner_type}'",
+                                        severity=types.DiagnosticSeverity.Error,
+                                    )
+                                )
+                                return
+                    return
+
+                # 7. Обычный идентификатор
                 if n.type == "identifier" and not is_ignored_identifier(n):
                     orig_text = source[n.start_byte : n.end_byte]
-                    if not is_declared(orig_text.lower()):
+                    found, _ = lookup_var(orig_text.lower())
+                    if not found:
                         extra_diagnostics.append(
                             types.Diagnostic(
                                 range=node_to_range(n),
@@ -655,7 +794,6 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                                 severity=types.DiagnosticSeverity.Error,
                             )
                         )
-                    return
 
                 for ch in n.children:
                     check_node(ch)
@@ -669,6 +807,7 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
     walk_tree(tree.root_node)
     return extra_diagnostics
 
+
 # endregion
 
 
@@ -678,7 +817,7 @@ def on_initialized(ls: LanguageServer, params: types.InitializedParams) -> None:
         global keywords
         keywords_path = Path(__file__).parent / "keywords.txt"
         keywords = [
-            line
+            line.lower()
             for line in keywords_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
@@ -686,7 +825,7 @@ def on_initialized(ls: LanguageServer, params: types.InitializedParams) -> None:
         global builtin_identifiers
         identifiers_path = Path(__file__).parent / "identifiers.txt"
         builtin_identifiers = [
-            line
+            line.lower()
             for line in identifiers_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
@@ -729,6 +868,12 @@ def on_initialized(ls: LanguageServer, params: types.InitializedParams) -> None:
                 if file_uri not in visited_uris:
                     try:
                         text = file_path.read_text(encoding="utf-8", errors="ignore")
+                        index_source(
+                            uri=file_uri,
+                            source=text,
+                            workspace_root=root_path,
+                            visited_uris=visited_uris,
+                        )
                     except OSError:
                         pass
 
@@ -853,6 +998,138 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> types.Hover | None:
         ),
         range=node_to_range(node),
     )
+
+
+@server.feature(types.TEXT_DOCUMENT_DEFINITION)
+def goto_definition(
+    ls: LanguageServer, params: types.DefinitionParams
+) -> list[types.Location] | types.Location | None:
+    doc = ls.workspace.get_text_document(params.text_document.uri)
+    tree = parser.parse(bytes(doc.source, "utf-8"))
+    point = (params.position.line, params.position.character)
+    node = tree.root_node.descendant_for_point_range(point, point)
+    if not node:
+        return None
+
+    # 1. Переход по #include "path/to/file.zs"
+    curr = node
+    while curr:
+        if curr.type == "include_definition":
+            path_node = curr.child_by_field_name("path")
+            if path_node:
+                inc_text = doc.source[path_node.start_byte : path_node.end_byte]
+                root = get_workspace_root_for_uri(ls, doc.uri)
+                target_file = resolve_include_path(root, doc.uri, inc_text)
+                if target_file:
+                    return types.Location(
+                        uri=target_file.as_uri(),
+                        range=types.Range(
+                            start=types.Position(line=0, character=0),
+                            end=types.Position(line=0, character=0),
+                        ),
+                    )
+            return None
+        curr = curr.parent
+
+    target_key = (
+        doc.source[node.start_byte : node.end_byte].strip('"').strip("'").lower()
+    )
+    if not target_key:
+        return None
+
+    # 2. Точный переход для члена класса после точки (например: lib.Print или MyLibrary.GetInstance)
+    parent = node.parent
+    if parent and parent.type == "member_access_expression":
+        member_node = parent.child_by_field_name("member")
+        if member_node and member_node.id == node.id and parent.children:
+            obj_node = parent.children[0]
+            obj_ident = doc.source[obj_node.start_byte : obj_node.end_byte].lower()
+            resolved_owner = resolve_identifier_type(obj_ident, doc.source, point)
+            if resolved_owner:
+                members = get_members_with_inheritance(resolved_owner)
+                matched = [
+                    m.location for m in members if m.orig_name.lower() == target_key
+                ]
+                if matched:
+                    return matched
+
+    # 3. Поиск среди параметров и локальных переменных текущего метода
+    current_method, _ = find_enclosing_by_line(tree.root_node, point[0])
+    if current_method:
+        # 3a. Параметры метода
+        param_list = next(
+            (c for c in current_method.children if c.type == "parameter_list"), None
+        )
+        if param_list:
+            for n_node in param_list.children_by_field_name("name"):
+                if (
+                    doc.source[n_node.start_byte : n_node.end_byte].lower()
+                    == target_key
+                ):
+                    return types.Location(uri=doc.uri, range=node_to_range(n_node))
+
+        # 3b. Локальные переменные и константы внутри метода
+        found_local: Node | None = None
+
+        def find_local_decl(n: Node) -> None:
+            nonlocal found_local
+            if found_local or n.start_point.row > point[0]:
+                return
+
+            if n.type == "declaration_statement":
+                for child in n.children:
+                    if (
+                        child.type == "identifier"
+                        and doc.source[child.start_byte : child.end_byte].lower()
+                        == target_key
+                    ):
+                        found_local = child
+                        return
+                    if child.type == "assignment_expression":
+                        left = child.child_by_field_name("left")
+                        if (
+                            left
+                            and left.type == "identifier"
+                            and doc.source[left.start_byte : left.end_byte].lower()
+                            == target_key
+                        ):
+                            found_local = left
+                            return
+
+            elif n.type in ("const_definition", "const_array_definition"):
+                name_node = n.child_by_field_name("name")
+                if (
+                    name_node
+                    and doc.source[name_node.start_byte : name_node.end_byte].lower()
+                    == target_key
+                ):
+                    found_local = name_node
+                    return
+
+            elif n.type == "foreach_statement":
+                for f_name in ("left", "value"):
+                    f_node = n.child_by_field_name(f_name)
+                    if (
+                        f_node
+                        and f_node.type == "identifier"
+                        and doc.source[f_node.start_byte : f_node.end_byte].lower()
+                        == target_key
+                    ):
+                        found_local = f_node
+                        return
+
+            for ch in n.children:
+                find_local_decl(ch)
+
+        find_local_decl(current_method)
+        if found_local:
+            return types.Location(uri=doc.uri, range=node_to_range(found_local))
+
+    # 4. Переход к глобальным классам, структурам, полям и методам
+    entries = symbol_index.get(target_key)
+    if not entries:
+        return None
+    return [e.location for e in entries]
 
 
 @server.feature(types.WORKSPACE_DID_CHANGE_CONFIGURATION)
