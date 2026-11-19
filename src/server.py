@@ -482,18 +482,18 @@ def collect_declared_names(method_node: Node, source: str) -> set[str]:
 
 
 def is_ignored_identifier(node: Node) -> bool:
-    """Checks whether an identifier is a type name, a field following a dot, or a declaration."""
+    """Проверяет, является ли идентификатор именем типа, поля после точки или объявлением."""
     parent = node.parent
     if not parent:
         return True
 
-    # The part to the right of the dot: obj.member
+    # Правая часть после точки: obj.member
     if parent.type == "member_access_expression":
         member_node = parent.child_by_field_name("member")
         if member_node and member_node.id == node.id:
             return True
 
-    # Declarations of variables, parameters, constants, and types
+    # Объявления переменных, параметров, констант, типов, меток и спрайтов
     if parent.type in (
         "declaration_statement",
         "parameter_list",
@@ -508,7 +508,7 @@ def is_ignored_identifier(node: Node) -> bool:
     ):
         return True
 
-    # The left-hand part of the declaration, including the assignment, within a declaration_statement: int a = 1;
+    # Левая часть объявления с присваиванием: int a = 1; или let a = 1;
     if (
         parent.type == "assignment_expression"
         and parent.parent
@@ -518,14 +518,14 @@ def is_ignored_identifier(node: Node) -> bool:
         if left and left.id == node.id:
             return True
 
-    # foreach loop variables (t, score : list)
+    # Переменные цикла foreach (t, score : list)
     if parent.type == "foreach_statement":
         left = parent.child_by_field_name("left")
         val = parent.child_by_field_name("value")
         if (left and left.id == node.id) or (val and val.id == node.id):
             return True
 
-    # Named function argument: func(alpha: 0.5)
+    # Именованный аргумент функции: func(alpha: 0.5)
     if parent.type == "_function_expression_argument":
         name_node = parent.child_by_field_name("name")
         if name_node and name_node.id == node.id:
@@ -535,7 +535,7 @@ def is_ignored_identifier(node: Node) -> bool:
 
 
 def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
-    """Searches for undeclared identifiers within method bodies."""
+    """Последовательно проверяет идентификаторы с учётом порядка объявления и блочных областей видимости."""
     tree = parser.parse(bytes(source, "utf-8"))
     extra_diagnostics: list[types.Diagnostic] = []
 
@@ -556,18 +556,98 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
             if not body:
                 return
 
-            # Collect all known names within this scope
-            known = set(builtin_identifiers)
-            known.update(symbol_index.keys())
-            known.update(collect_declared_names(node, source))
+            # Базовый scope: встроенные имена + глобальные символы + члены класса + параметры метода
+            base_scope = set(builtin_identifiers)
+            base_scope.update(symbol_index.keys())
             if current_class:
                 for m in get_members_with_inheritance(current_class):
-                    known.add(m.orig_name.lower())
+                    base_scope.add(m.orig_name.lower())
 
-            def check_body(n: Node) -> None:
+            param_list = next(
+                (c for c in node.children if c.type == "parameter_list"), None
+            )
+            if param_list:
+                for n_node in param_list.children_by_field_name("name"):
+                    base_scope.add(source[n_node.start_byte : n_node.end_byte].lower())
+
+            scope_stack: list[set[str]] = [base_scope]
+
+            def is_declared(name_lower: str) -> bool:
+                return any(name_lower in scope for scope in reversed(scope_stack))
+
+            def check_node(n: Node) -> None:
+                # 1. Вложенный блок { ... } создаёт локальную область видимости
+                if n.type == "block":
+                    scope_stack.append(set())
+                    for ch in n.children:
+                        check_node(ch)
+                    scope_stack.pop()
+                    return
+
+                # 2. Цикл for (int i = 0; ...) изолирует счётчик i внутри цикла
+                if n.type == "for_statement":
+                    scope_stack.append(set())
+                    for ch in n.children:
+                        check_node(ch)
+                    scope_stack.pop()
+                    return
+
+                # 3. Цикл foreach (k, v : list) сначала проверяет list, затем регистрирует k и v
+                if n.type == "foreach_statement":
+                    right_node = n.child_by_field_name("right")
+                    if right_node:
+                        check_node(right_node)
+
+                    scope_stack.append(set())
+                    for field_name in ("left", "value"):
+                        f_node = n.child_by_field_name(field_name)
+                        if f_node and f_node.type == "identifier":
+                            scope_stack[-1].add(
+                                source[f_node.start_byte : f_node.end_byte].lower()
+                            )
+
+                    body_node = n.child_by_field_name("body")
+                    if body_node:
+                        check_node(body_node)
+                    scope_stack.pop()
+                    return
+
+                # 4. Объявление переменной: сначала проверяем правую часть, потом добавляем имя в текущий scope
+                if n.type == "declaration_statement":
+                    for child in n.children:
+                        if child.type == "identifier":
+                            scope_stack[-1].add(
+                                source[child.start_byte : child.end_byte].lower()
+                            )
+                        elif child.type == "assignment_expression":
+                            right = child.child_by_field_name("right")
+                            if right:
+                                check_node(right)
+                            left = child.child_by_field_name("left")
+                            if left and left.type == "identifier":
+                                scope_stack[-1].add(
+                                    source[left.start_byte : left.end_byte].lower()
+                                )
+                    return
+
+                # 5. Локальная константа внутри метода
+                if n.type in ("const_definition", "const_array_definition"):
+                    val_node = n.child_by_field_name("value") or n.child_by_field_name(
+                        "contents"
+                    )
+                    if val_node:
+                        check_node(val_node)
+                    name_node = n.child_by_field_name("name")
+                    if name_node:
+                        scope_stack[-1].add(
+                            source[name_node.start_byte : name_node.end_byte].lower()
+                        )
+                    return
+
+                # 6. Обычный идентификатор в выражении
                 if n.type == "identifier" and not is_ignored_identifier(n):
                     orig_text = source[n.start_byte : n.end_byte]
-                    if orig_text.lower() not in known:
+                    if not is_declared(orig_text.lower()):
                         extra_diagnostics.append(
                             types.Diagnostic(
                                 range=node_to_range(n),
@@ -575,10 +655,12 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                                 severity=types.DiagnosticSeverity.Error,
                             )
                         )
-                for ch in n.children:
-                    check_body(ch)
+                    return
 
-            check_body(body)
+                for ch in n.children:
+                    check_node(ch)
+
+            check_node(body)
             return
 
         for ch in node.children:
@@ -586,6 +668,7 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
 
     walk_tree(tree.root_node)
     return extra_diagnostics
+
 # endregion
 
 
