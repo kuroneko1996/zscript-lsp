@@ -44,7 +44,7 @@ To index built-in engine classes (such as `Actor`, `Weapon`, or `PlayerPawn`), s
 }
 ```
 
-## Configuration (Sublime Text) WIP
+## Configuration (Sublime Text)
 
 LSP Package is required.
 
@@ -62,10 +62,46 @@ User\LSP.sublime-settings
         "F:\\projects\\zscript-lsp",
         "F:\\projects\\zscript-lsp\\src\\server.py"
       ],
-      "selector": "source.zscript"
+      "selector": "source.zscript",
+      "initializationOptions": {
+        "pk3_paths": ["C:\\Games\\UZDoom\\uzdoom.pk3"]
+      }
     }
   }
 }
+```
+
+## Configuration (Neovim 0.11+)
+
+```lua
+-- Register extensions .zs / .zsc as zscript filetype
+vim.filetype.add({
+  extension = {
+    zs = "zscript",
+    zsc = "zscript",
+    zscript = "zscript",
+  },
+})
+
+-- Setup and enable zscript-lsp
+vim.lsp.config("zscript_lsp", {
+  cmd = {
+    "uv",
+    "run",
+    "--project",
+    "F:/projects/zscript-lsp",
+    "F:/projects/zscript-lsp/src/server.py",
+  },
+  filetypes = { "zscript" },
+  root_markers = { "zscript.zs", "zscript.zsc", "zscript.txt", ".git" },
+  init_options = {
+    pk3_paths = {
+      "C:/Games/UZDoom/uzdoom.pk3",
+    },
+  },
+})
+
+vim.lsp.enable("zscript_lsp")
 ```
 
 ## Running Manually
