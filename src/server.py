@@ -569,14 +569,35 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> types.Hover | None:
     node = tree.root_node.descendant_for_point_range(point, point)
     if not node:
         return None
+
     target_key = (
         doc.source[node.start_byte : node.end_byte].strip('"').strip("'").lower()
     )
-    entries = symbol_index.get(target_key)
+
+    # Checking whether the word under the cursor is a class member following a dot (for example: MyLibrary.GetInstance)
+    filtered_entries: list[SymbolInfo] | None = None
+    parent = node.parent
+    if parent and parent.type == "member_access_expression":
+        member_node = parent.child_by_field_name("member")
+        if member_node and member_node.id == node.id and parent.children:
+            obj_node = parent.children[0]
+            obj_ident = doc.source[obj_node.start_byte : obj_node.end_byte].lower()
+            resolved_owner = resolve_identifier_type(obj_ident, doc.source, point)
+            if resolved_owner:
+                # Search for a method/field only in the inheritanche chain of this class
+                members = get_members_with_inheritance(resolved_owner)
+                matched = [m for m in members if m.orig_name.lower() == target_key]
+                if matched:
+                    filtered_entries = matched
+
+    # If this is not a dot-notation call (or the type on the left could not be determined), retrieve it from the general index
+    entries = filtered_entries if filtered_entries is not None else symbol_index.get(target_key)
     if not entries:
         return None
+
     unique_sigs = list(dict.fromkeys(e.signature for e in entries))
     markdown = "\n\n---\n\n".join(f"```zscript\n{sig}\n```" for sig in unique_sigs)
+
     return types.Hover(
         contents=types.MarkupContent(
             kind=types.MarkupKind.Markdown,
