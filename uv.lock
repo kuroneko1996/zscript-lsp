@@ -356,11 +356,7 @@ wheels = [
 [[package]]
 name = "tree-sitter-zscript"
 version = "0.1.0"
-source = { editable = "F:/projects/zscript-grammar" }
-
-[package.metadata]
-requires-dist = [{ name = "tree-sitter", marker = "extra == 'core'", specifier = "~=0.24" }]
-provides-extras = ["core"]
+source = { git = "https://github.com/kuroneko1996/tree-sitter-zscript#5cfd227599061a0b482699edbf7858bcdb987658" }
 
 [[package]]
 name = "typing-extensions"
@@ -390,7 +386,7 @@ dev = [
 requires-dist = [
     { name = "pygls", specifier = ">=2.1.1" },
     { name = "tree-sitter", specifier = ">=0.26.1" },
-    { name = "tree-sitter-zscript", editable = "F:/projects/zscript-grammar" },
+    { name = "tree-sitter-zscript", git = "https://github.com/kuroneko1996/tree-sitter-zscript" },
 ]
 
 [package.metadata.requires-dev]

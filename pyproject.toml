@@ -24,7 +24,7 @@ build-backend = "uv_build"
 package = false
 
 [tool.uv.sources]
-tree-sitter-zscript = { path = "F:/projects/zscript-grammar", editable = true }
+tree-sitter-zscript = { git = "https://github.com/kuroneko1996/tree-sitter-zscript" }
 
 [dependency-groups]
 dev = [
