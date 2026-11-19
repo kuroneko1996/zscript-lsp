@@ -13,6 +13,8 @@ parser = Parser(ZSCRIPT_LANGUAGE)
 server = LanguageServer("zscript-lsp", "0.1.0")
 
 keywords: list[str]
+builtin_identifiers: list[str]
+
 
 @dataclass
 class SymbolInfo:
@@ -254,6 +256,7 @@ def index_source(
 def validate_and_index(ls: LanguageServer, uri: str, source: str) -> None:
     root = get_workspace_root_for_uri(ls, uri)
     diagnostics = index_source(uri, source, workspace_root=root)
+    diagnostics.extend(check_undefined_identifiers(source))
     ls.text_document_publish_diagnostics(
         types.PublishDiagnosticsParams(uri=uri, diagnostics=diagnostics)
     )
@@ -441,15 +444,173 @@ def resolve_identifier_type(
     return None
 
 
+# region Declared Variables Check
+def collect_declared_names(method_node: Node, source: str) -> set[str]:
+    """Collects all parameters and local variables within a method."""
+    declared: set[str] = set()
+
+    # 1. Method parameters
+    param_list = next(
+        (c for c in method_node.children if c.type == "parameter_list"), None
+    )
+    if param_list:
+        for n_node in param_list.children_by_field_name("name"):
+            declared.add(source[n_node.start_byte : n_node.end_byte].lower())
+
+    # 2. Local variables (including let, for, and foreach)
+    def walk_decls(n: Node) -> None:
+        if n.type == "declaration_statement":
+            for child in n.children:
+                if child.type == "identifier":
+                    declared.add(source[child.start_byte : child.end_byte].lower())
+                elif child.type == "assignment_expression":
+                    left = child.child_by_field_name("left")
+                    if left and left.type == "identifier":
+                        declared.add(source[left.start_byte : left.end_byte].lower())
+
+        elif n.type == "foreach_statement":
+            for field_name in ("left", "value"):
+                f_node = n.child_by_field_name(field_name)
+                if f_node and f_node.type == "identifier":
+                    declared.add(source[f_node.start_byte : f_node.end_byte].lower())
+
+        for ch in n.children:
+            walk_decls(ch)
+
+    walk_decls(method_node)
+    return declared
+
+
+def is_ignored_identifier(node: Node) -> bool:
+    """Checks whether an identifier is a type name, a field following a dot, or a declaration."""
+    parent = node.parent
+    if not parent:
+        return True
+
+    # The part to the right of the dot: obj.member
+    if parent.type == "member_access_expression":
+        member_node = parent.child_by_field_name("member")
+        if member_node and member_node.id == node.id:
+            return True
+
+    # Declarations of variables, parameters, constants, and types
+    if parent.type in (
+        "declaration_statement",
+        "parameter_list",
+        "class_type",
+        "const_definition",
+        "const_array_definition",
+        "enum_declaration",
+        "enum_declaration_value",
+        "state_label",
+        "frame_sprite",
+        "control_statement",
+    ):
+        return True
+
+    # The left-hand part of the declaration, including the assignment, within a declaration_statement: int a = 1;
+    if (
+        parent.type == "assignment_expression"
+        and parent.parent
+        and parent.parent.type == "declaration_statement"
+    ):
+        left = parent.child_by_field_name("left")
+        if left and left.id == node.id:
+            return True
+
+    # foreach loop variables (t, score : list)
+    if parent.type == "foreach_statement":
+        left = parent.child_by_field_name("left")
+        val = parent.child_by_field_name("value")
+        if (left and left.id == node.id) or (val and val.id == node.id):
+            return True
+
+    # Named function argument: func(alpha: 0.5)
+    if parent.type == "_function_expression_argument":
+        name_node = parent.child_by_field_name("name")
+        if name_node and name_node.id == node.id:
+            return True
+
+    return False
+
+
+def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
+    """Searches for undeclared identifiers within method bodies."""
+    tree = parser.parse(bytes(source, "utf-8"))
+    extra_diagnostics: list[types.Diagnostic] = []
+
+    def walk_tree(node: Node, current_class: str | None = None) -> None:
+        if node.type in ("class_definition", "struct_definition"):
+            name_node = node.child_by_field_name("name")
+            cls_name = (
+                source[name_node.start_byte : name_node.end_byte].lower()
+                if name_node
+                else current_class
+            )
+            for ch in node.children:
+                walk_tree(ch, cls_name)
+            return
+
+        if node.type == "method_declaration":
+            body = next((c for c in node.children if c.type == "block"), None)
+            if not body:
+                return
+
+            # Collect all known names within this scope
+            known = set(builtin_identifiers)
+            known.update(symbol_index.keys())
+            known.update(collect_declared_names(node, source))
+            if current_class:
+                for m in get_members_with_inheritance(current_class):
+                    known.add(m.orig_name.lower())
+
+            def check_body(n: Node) -> None:
+                if n.type == "identifier" and not is_ignored_identifier(n):
+                    orig_text = source[n.start_byte : n.end_byte]
+                    if orig_text.lower() not in known:
+                        extra_diagnostics.append(
+                            types.Diagnostic(
+                                range=node_to_range(n),
+                                message=f"Unknown identifier '{orig_text}'",
+                                severity=types.DiagnosticSeverity.Error,
+                            )
+                        )
+                for ch in n.children:
+                    check_body(ch)
+
+            check_body(body)
+            return
+
+        for ch in node.children:
+            walk_tree(ch, current_class)
+
+    walk_tree(tree.root_node)
+    return extra_diagnostics
+# endregion
+
+
 @server.feature(types.INITIALIZED)
 def on_initialized(ls: LanguageServer, params: types.InitializedParams) -> None:
     try:
         global keywords
         keywords_path = Path(__file__).parent / "keywords.txt"
-        keywords = [line for line in keywords_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    except OSError as err:
-        ls.window_show_message(types.ShowMessageParams(types.MessageType.Error, str(err)))
+        keywords = [
+            line
+            for line in keywords_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
 
+        global builtin_identifiers
+        identifiers_path = Path(__file__).parent / "identifiers.txt"
+        builtin_identifiers = [
+            line
+            for line in identifiers_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except OSError as err:
+        ls.window_show_message(
+            types.ShowMessageParams(types.MessageType.Error, str(err))
+        )
 
     visited_uris: set[str] = set()
     for folder in ls.workspace.folders.values():
@@ -591,7 +752,11 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> types.Hover | None:
                     filtered_entries = matched
 
     # If this is not a dot-notation call (or the type on the left could not be determined), retrieve it from the general index
-    entries = filtered_entries if filtered_entries is not None else symbol_index.get(target_key)
+    entries = (
+        filtered_entries
+        if filtered_entries is not None
+        else symbol_index.get(target_key)
+    )
     if not entries:
         return None
 
