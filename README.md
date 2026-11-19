@@ -70,6 +70,9 @@ User\LSP.sublime-settings
   }
 }
 ```
+[syntax highlighting](https://gist.github.com/kuroneko1996/11dc8284a8a12f3c5b01f1347a03ea7a)
+
+place in Packages -> User
 
 ## Configuration (Neovim 0.11+)
 
