@@ -94,7 +94,8 @@ def apply_settings(raw_settings: object, ls: LanguageServer) -> None:
 
     ls.window_show_message(
         types.ShowMessageParams(
-            types.MessageType.Info, "{} pk3(s) has been loaded.".format(loaded_count)
+            types.MessageType.Info,
+            f"{loaded_count} pk3(s) loaded.",
         )
     )
 
@@ -279,12 +280,13 @@ def index_source(
             match node.type:
                 case "class_definition":
                     inherit_node = node.child_by_field_name("inherit")
-                    if name_node and inherit_node:
+                    if name_node and inherit_node and inherit_node.next_named_sibling:
                         cls_key = source[
                             name_node.start_byte : name_node.end_byte
                         ].lower()
+                        parent_node = inherit_node.next_named_sibling
                         parent_key = source[
-                            inherit_node.start_byte : inherit_node.end_byte
+                            parent_node.start_byte : parent_node.end_byte
                         ].lower()
                         class_parents[cls_key] = parent_key
                     add_symbol(name_node, node, types.CompletionItemKind.Class)
