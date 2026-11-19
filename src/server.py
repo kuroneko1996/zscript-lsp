@@ -12,6 +12,7 @@ parser = Parser(ZSCRIPT_LANGUAGE)
 
 server = LanguageServer("zscript-lsp", "0.1.0")
 
+keywords: list[str]
 
 @dataclass
 class SymbolInfo:
@@ -437,6 +438,14 @@ def resolve_identifier_type(
 
 @server.feature(types.INITIALIZED)
 def on_initialized(ls: LanguageServer, params: types.InitializedParams) -> None:
+    try:
+        global keywords
+        keywords_path = Path(__file__).parent / "keywords.txt"
+        keywords = [line for line in keywords_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except OSError as err:
+        ls.window_show_message(types.ShowMessageParams(types.MessageType.Error, str(err)))
+
+
     visited_uris: set[str] = set()
     for folder in ls.workspace.folders.values():
         root_path = uri_to_path(folder.uri).resolve()
@@ -493,25 +502,6 @@ def did_change(ls: LanguageServer, params: types.DidChangeTextDocumentParams) ->
 def completions(
     ls: LanguageServer, params: types.CompletionParams
 ) -> types.CompletionList:
-    # Default items
-    keywords = [
-        "class",
-        "struct",
-        "enum",
-        "States",
-        "Default",
-        "override",
-        "clearscope",
-        "play",
-        "ui",
-        "action",
-        "static",
-        "const",
-        "let",
-        "return",
-        "for",
-        "foreach",
-    ]
     items = []
 
     doc = ls.workspace.get_text_document(params.text_document.uri)
