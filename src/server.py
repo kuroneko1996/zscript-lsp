@@ -1,3 +1,5 @@
+import re
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -14,6 +16,7 @@ server = LanguageServer("zscript-lsp", "0.1.0")
 
 keywords: list[str]
 builtin_identifiers: list[str]
+indexed_pk3s: set[str] = set()
 
 
 @dataclass
@@ -37,6 +40,63 @@ class_parents: dict[str, str] = {}
 # Links symbols to files for quick clearing or reindexing
 file_symbols: dict[str, set[str]] = {}
 file_classes: dict[str, set[str]] = {}
+
+
+def index_pk3(pk3_path_str: str) -> None:
+    """Читает все ZScript-файлы напрямую из ZIP/PK3 архива движка."""
+    pk3_path = Path(pk3_path_str).expanduser().resolve()
+    if not pk3_path.is_file() or str(pk3_path) in indexed_pk3s:
+        return
+
+    indexed_pk3s.add(str(pk3_path))
+    with zipfile.ZipFile(pk3_path, "r") as zf:
+        # Ищем корневой zscript.zs / zscript.txt внутри архива или все .zs/.zsc
+        all_names = zf.namelist()
+        zscript_entries = [
+            name
+            for name in all_names
+            if name.lower().startswith("zscript")
+            and name.lower().endswith((".zs", ".zsc", ".zscript"))
+        ]
+
+        for entry_name in zscript_entries:
+            raw_bytes = zf.read(entry_name)
+            text = raw_bytes.decode("utf-8", errors="ignore")
+            # Формируем виртуальный URI вида zip:///C:/.../uzdoom.pk3/zscript/actors/actor.zs
+            virtual_uri = f"zip:///{pk3_path.as_posix().lstrip('/')}/{entry_name}"
+            index_source(uri=virtual_uri, source=text)
+
+
+def apply_settings(raw_settings: object, ls: LanguageServer) -> None:
+    if not isinstance(raw_settings, dict):
+        return
+    # Zed может передать настройки напрямую или вложенными в ключ "zscript-lsp"
+    cfg = raw_settings.get("zscript-lsp", raw_settings)
+    pk3_list = cfg.get("pk3_paths", []) if isinstance(cfg, dict) else []
+    if not pk3_list:
+        ls.window_show_message(
+            types.ShowMessageParams(types.MessageType.Warning, "PK3 List is empty")
+        )
+    loaded_count = 0
+    for pk3 in pk3_list:
+        if isinstance(pk3, str):
+            try:
+                index_pk3(pk3)
+                loaded_count += 1
+            except zipfile.BadZipfile as err:
+                ls.window_show_message(
+                    types.ShowMessageParams(types.MessageType.Error, str(err))
+                )
+            except OSError as err:
+                ls.window_show_message(
+                    types.ShowMessageParams(types.MessageType.Error, str(err))
+                )
+
+    ls.window_show_message(
+        types.ShowMessageParams(
+            types.MessageType.Info, "{} pk3(s) has been loaded.".format(loaded_count)
+        )
+    )
 
 
 def uri_to_path(uri: str) -> Path:
@@ -262,6 +322,135 @@ def validate_and_index(ls: LanguageServer, uri: str, source: str) -> None:
     )
 
 
+def collect_visible_locals(
+    source: str, point: tuple[int, int]
+) -> list[types.CompletionItem]:
+    """Собирает локальные переменные, параметры и члены текущего класса для автодополнения."""
+    items: list[types.CompletionItem] = []
+    seen: set[str] = set()
+
+    tree = parser.parse(bytes(source, "utf-8"))
+    current_method, owner_node = find_enclosing_by_line(tree.root_node, point[0])
+
+    # 1. Члены текущего класса и его родителей (если мы внутри класса/структуры)
+    if owner_node:
+        name_node = owner_node.child_by_field_name("name")
+        if name_node:
+            cls_lower = source[name_node.start_byte : name_node.end_byte].lower()
+            for m in get_members_with_inheritance(cls_lower):
+                key = m.orig_name.lower()
+                if key not in seen:
+                    seen.add(key)
+                    sig_lines = m.signature.splitlines()
+                    sig = sig_lines[1].strip() if len(sig_lines) > 1 else m.signature
+                    items.append(
+                        types.CompletionItem(
+                            label=m.orig_name,
+                            kind=m.kind,
+                            detail=sig,
+                        )
+                    )
+
+    if not current_method:
+        return items
+
+    # 2. Параметры текущего метода
+    param_list = next(
+        (c for c in current_method.children if c.type == "parameter_list"), None
+    )
+    if param_list:
+        p_types = param_list.children_by_field_name("type")
+        p_names = param_list.children_by_field_name("name")
+        for t_node, n_node in zip(p_types, p_names):
+            orig = source[n_node.start_byte : n_node.end_byte]
+            key = orig.lower()
+            if key not in seen:
+                seen.add(key)
+                t_str = source[t_node.start_byte : t_node.end_byte]
+                items.append(
+                    types.CompletionItem(
+                        label=orig,
+                        kind=types.CompletionItemKind.Variable,
+                        detail=f"{t_str} {orig}",
+                    )
+                )
+
+    # 3. Локальные переменные из AST метода (до текущей строки)
+    def walk_method(n: Node) -> None:
+        if n.start_point.row > point[0]:
+            return
+        if n.type == "declaration_statement":
+            t_node = n.child_by_field_name("type")
+            t_str = source[t_node.start_byte : t_node.end_byte] if t_node else "let"
+            for child in n.children:
+                if child.type == "identifier":
+                    orig = source[child.start_byte : child.end_byte]
+                    key = orig.lower()
+                    if key not in seen:
+                        seen.add(key)
+                        items.append(
+                            types.CompletionItem(
+                                label=orig,
+                                kind=types.CompletionItemKind.Variable,
+                                detail=f"{t_str} {orig}",
+                            )
+                        )
+                elif child.type == "assignment_expression":
+                    left = child.child_by_field_name("left")
+                    if left and left.type == "identifier":
+                        orig = source[left.start_byte : left.end_byte]
+                        key = orig.lower()
+                        if key not in seen:
+                            seen.add(key)
+                            items.append(
+                                types.CompletionItem(
+                                    label=orig,
+                                    kind=types.CompletionItemKind.Variable,
+                                    detail=f"{t_str} {orig}",
+                                )
+                            )
+        elif n.type == "foreach_statement":
+            for f_name in ("left", "value"):
+                f_node = n.child_by_field_name(f_name)
+                if f_node and f_node.type == "identifier":
+                    orig = source[f_node.start_byte : f_node.end_byte]
+                    key = orig.lower()
+                    if key not in seen:
+                        seen.add(key)
+                        items.append(
+                            types.CompletionItem(
+                                label=orig,
+                                kind=types.CompletionItemKind.Variable,
+                                detail=orig,
+                            )
+                        )
+        for ch in n.children:
+            walk_method(ch)
+
+    walk_method(current_method)
+
+    # 4. Резервный поиск по тексту строк метода до курсора (на случай ERROR при наборе)
+    method_lines = source.splitlines()[current_method.start_point.row : point[0] + 1]
+    method_prefix = "\n".join(method_lines)
+    for mm in re.finditer(
+        r"\b(?:let|[a-zA-Z_]\w*(?:<[^>]+>)?)\s+([a-zA-Z_]\w*)\s*(?:=|;|\[|,)",
+        method_prefix,
+    ):
+        orig = mm.group(1)
+        key = orig.lower()
+        if key not in seen and key not in keywords:
+            seen.add(key)
+            items.append(
+                types.CompletionItem(
+                    label=orig,
+                    kind=types.CompletionItemKind.Variable,
+                    detail=orig,
+                )
+            )
+
+    return items
+
+
 def get_members_with_inheritance(class_key: str) -> list[SymbolInfo]:
     result: list[SymbolInfo] = []
     seen_members: set[str] = set()
@@ -275,7 +464,10 @@ def get_members_with_inheritance(class_key: str) -> list[SymbolInfo]:
             if m_key not in seen_members:
                 seen_members.add(m_key)
                 result.append(member)
-        curr = class_parents.get(curr, "")
+        next_parent = class_parents.get(curr, "")
+        if not next_parent and curr != "object" and "object" not in visited_classes:
+            next_parent = "object"
+        curr = next_parent
 
     return result
 
@@ -432,6 +624,37 @@ def resolve_identifier_type(
             return None
 
         local_type = scan_locals(current_method)
+        if not local_type and current_method:
+            method_text = source[current_method.start_byte : current_method.end_byte]
+            # Ищем "let shotgunner = new("ShotgunGuy")" или "ShotgunGuy shotgunner"
+            m_new = re.search(
+                rf"\blet\s+{re.escape(ident_lower)}\s*=\s*new\s*\(\s*['\"]([^'\"]+)['\"]\s*\)",
+                method_text,
+                re.IGNORECASE,
+            )
+            if m_new:
+                return m_new.group(1).lower()
+
+            m_call = re.search(
+                rf"\blet\s+{re.escape(ident_lower)}\s*=\s*([a-zA-Z_]\w*)\.([a-zA-Z_]\w*)\s*\(",
+                method_text,
+                re.IGNORECASE,
+            )
+            if m_call:
+                cls_n, meth_n = m_call.group(1).lower(), m_call.group(2).lower()
+                owner_t = current_class if cls_n == "self" else cls_n
+                for m in get_members_with_inheritance(owner_t or ""):
+                    if m.orig_name.lower() == meth_n and m.type_name:
+                        return m.type_name
+
+            m_decl = re.search(
+                rf"\b([a-zA-Z_]\w*)\s+{re.escape(ident_lower)}\b",
+                method_text,
+                re.IGNORECASE,
+            )
+            if m_decl and m_decl.group(1).lower() in class_members:
+                return m_decl.group(1).lower()
+
         if local_type:
             return local_type
 
@@ -811,6 +1034,12 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
 # endregion
 
 
+@server.feature(types.INITIALIZE)
+def on_initialize(ls: LanguageServer, params: types.InitializeParams) -> None:
+    if params.initialization_options:
+        apply_settings(params.initialization_options, ls)
+
+
 @server.feature(types.INITIALIZED)
 def on_initialized(ls: LanguageServer, params: types.InitializedParams) -> None:
     try:
@@ -926,6 +1155,9 @@ def completions(
                     )
                 )
     else:
+        point = (params.position.line, params.position.character)
+        items.extend(collect_visible_locals(doc.source, point))
+
         for kw in keywords:
             items.append(
                 types.CompletionItem(label=kw, kind=types.CompletionItemKind.Keyword)
@@ -1012,7 +1244,7 @@ def goto_definition(
         return None
 
     # 1. Переход по #include "path/to/file.zs"
-    curr = node
+    curr: Node | None = node
     while curr:
         if curr.type == "include_definition":
             path_node = curr.child_by_field_name("path")
@@ -1136,7 +1368,8 @@ def goto_definition(
 def did_change_configuration(
     ls: LanguageServer, params: types.DidChangeConfigurationParams
 ) -> None:
-    pass
+    if params.settings:
+        apply_settings(params.settings, ls)
 
 
 if __name__ == "__main__":
