@@ -349,7 +349,7 @@ def find_owner_node(node: Node) -> tuple[str, str] | None:
     """Returns (owner_type, original_owner_name) for a method or property."""
     parent = node.parent
     while parent:
-        if parent.type in ("class_definition", "struct_definition"):
+        if parent.type in ("class_definition", "struct_definition", "extend_class"):
             kind = "class" if parent.type == "class_definition" else "struct"
             name_node = parent.child_by_field_name("name")
             if name_node and name_node.text:
