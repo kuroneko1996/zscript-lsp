@@ -133,6 +133,35 @@ def apply_settings(raw_settings: object, ls: LanguageServer) -> None:
     )
 
 
+def load_actors_builtin_actor_flags() -> None:
+    flags_path = Path(__file__).parent / "builtin_actor_flags.txt"
+    if flags_path.is_file():
+        dummy_loc = types.Location(
+            uri=flags_path.as_uri(),
+            range=types.Range(
+                start=types.Position(line=0, character=0),
+                end=types.Position(line=0, character=0),
+            ),
+        )
+        for line in flags_path.read_text(encoding="utf-8").splitlines():
+            flag_name = line.strip()
+            if not flag_name:
+                continue
+            # Красивый регистр: bDropped (если в файле в нижнем регистре)
+            orig = f"b{flag_name[1:].capitalize()}" if flag_name.startswith("b") else flag_name
+            info = SymbolInfo(
+                orig_name=orig,
+                kind=types.CompletionItemKind.Property,
+                uri=flags_path.as_uri(),
+                location=dummy_loc,
+                signature=f"bool {orig}; // Built-in Actor flag",
+                owner="Actor",
+                type_name="bool",
+            )
+            class_members.setdefault("actor", []).append(info)
+
+
+
 def build_semantic_tokens(source: str) -> list[int]:
     tree = parser.parse(bytes(source, "utf-8"))
     # Собираем сырые токены: (line, start_char, length, type_idx, modifiers_mask)
@@ -460,6 +489,36 @@ def index_source(
                             break
             if const_name:
                 add_symbol(const_name, node, types.CompletionItemKind.Constant)
+        elif node.type in ("flagdef_declaration"):
+            flag_node = name_node or node.child_by_field_name("flag")
+            if not flag_node:
+                # Берём первый identifier внутри flagdef (например, Solid из "flagdef Solid: flags, 0;")
+                flag_node = next((ch for ch in node.children if ch.type == "identifier"), None)
+            if flag_node:
+                raw_flag = node_text(flag_node, source)
+                # Если имя в flagdef указано без префикса 'b' (например Solid), добавляем 'b' -> bSolid
+                full_flag = raw_flag if raw_flag.lower().startswith("b") else f"b{raw_flag}"
+                key = full_flag.lower()
+                owner_info = find_owner_node(node)
+                owner_name = owner_info[1] if owner_info else None
+                sig = extract_signature(node, source)
+
+                info = SymbolInfo(
+                    orig_name=full_flag,
+                    kind=types.CompletionItemKind.Property,
+                    uri=uri,
+                    location=types.Location(uri=uri, range=node_to_range(flag_node)),
+                    signature=sig,
+                    owner=owner_name,
+                    type_name="bool",
+                )
+                symbol_index.setdefault(key, []).append(info)
+                file_symbols[uri].add(key)
+
+                if owner_name:
+                    owner_key = owner_name.lower()
+                    class_members.setdefault(owner_key, []).append(info)
+                    file_classes[uri].add(owner_key)
         elif name_node:
             match node.type:
                 case "class_definition":
@@ -1259,6 +1318,8 @@ def on_initialized(ls: LanguageServer, params: types.InitializedParams) -> None:
             for line in identifiers_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+
+        load_actors_builtin_actor_flags()
     except OSError as err:
         ls.window_show_message(
             types.ShowMessageParams(types.MessageType.Error, str(err))
