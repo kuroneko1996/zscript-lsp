@@ -67,9 +67,12 @@ class_parents: dict[str, str] = {}
 file_symbols: dict[str, set[str]] = {}
 file_classes: dict[str, set[str]] = {}
 
+
 def node_text(node: Node, source: str) -> str:
     source_bytes = bytes(source, "utf-8")
-    return source_bytes[node.start_byte : node.end_byte].decode("utf-8", errors="ignore")
+    return source_bytes[node.start_byte : node.end_byte].decode(
+        "utf-8", errors="ignore"
+    )
 
 
 def index_pk3(pk3_path_str: str) -> None:
@@ -394,9 +397,7 @@ def index_source(
         owner_name = owner_info[1] if owner_info else None
         type_node = decl_node.child_by_field_name("type")
         type_name = (
-            node_text(type_node, source).strip("@").lower()
-            if type_node
-            else None
+            node_text(type_node, source).strip("@").lower() if type_node else None
         )
 
         info = SymbolInfo(
@@ -755,32 +756,23 @@ def resolve_identifier_type(
             p_names = param_list.children_by_field_name("name")
             for t_node, n_node in zip(p_types, p_names):
                 if node_text(n_node, source).lower() == ident_lower:
-                    return (
-                        node_text(t_node, source).strip("@").lower()
-                    )
+                    return node_text(t_node, source).strip("@").lower()
 
         # 3b. Local variables inside the method (including 'let')
         def scan_locals(n: Node) -> str | None:
             if n.type == "declaration_statement":
                 t_node = n.child_by_field_name("type")
                 if t_node:
-                    t_str = (
-                        node_text(t_node, source).strip("@").lower()
-                    )
+                    t_str = node_text(t_node, source).strip("@").lower()
                     for child in n.children:
                         if (
                             child.type == "identifier"
-                            and node_text(child, source).lower()
-                            == ident_lower
+                            and node_text(child, source).lower() == ident_lower
                         ):
                             return t_str
                         if child.type == "assignment_expression":
                             left = child.child_by_field_name("left")
-                            if (
-                                left
-                                and node_text(left, source).lower()
-                                == ident_lower
-                            ):
+                            if left and node_text(left, source).lower() == ident_lower:
                                 return t_str
                 else:
                     # let x = ...;
@@ -790,10 +782,7 @@ def resolve_identifier_type(
                             right = child.child_by_field_name("right")
                             if not left or not right:
                                 continue
-                            if (
-                                node_text(left, source).lower()
-                                == ident_lower
-                            ):
+                            if node_text(left, source).lower() == ident_lower:
                                 return infer_rhs_type(right, source, current_class)
 
             for ch in n.children:
@@ -920,6 +909,18 @@ def is_ignored_identifier(node: Node) -> bool:
         if left and left.id == node.id:
             return True
 
+    # Деструктурирующее объявление: let [a, b] = ...;
+    if (
+        parent.type == "array_expression"
+        and parent.parent
+        and parent.parent.type == "assignment_expression"
+        and parent.parent.parent
+        and parent.parent.parent.type == "declaration_statement"
+    ):
+        left = parent.parent.child_by_field_name("left")
+        if left and left.id == parent.id:
+            return True
+
     # Переменные цикла foreach (t, score : list)
     if parent.type == "foreach_statement":
         left = parent.child_by_field_name("left")
@@ -956,9 +957,7 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
         if node.type in ("class_definition", "struct_definition"):
             name_node = node.child_by_field_name("name")
             cls_name = (
-                node_text(name_node, source).lower()
-                if name_node
-                else current_class
+                node_text(name_node, source).lower() if name_node else current_class
             )
             for ch in node.children:
                 walk_tree(ch, cls_name)
@@ -997,9 +996,7 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                 p_names = param_list.children_by_field_name("name")
                 for t_node, n_node in zip(p_types, p_names):
                     p_name = node_text(n_node, source).lower()
-                    p_type = (
-                        node_text(t_node, source).strip("@").lower()
-                    )
+                    p_type = node_text(t_node, source).strip("@").lower()
                     base_scope[p_name] = p_type
 
             scope_stack: list[dict[str, str | None]] = [base_scope]
@@ -1016,9 +1013,7 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                     return None
 
                 if expr.type == "identifier":
-                    _, var_type = lookup_var(
-                        node_text(expr, source).lower()
-                    )
+                    _, var_type = lookup_var(node_text(expr, source).lower())
                     return var_type
 
                 if expr.type in ("function_expression", "typecast_expression"):
@@ -1035,10 +1030,7 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                             ) or expr.children_by_field_name("target")
                             for arg in args:
                                 raw = (
-                                    node_text(arg, source)
-                                    .strip("'")
-                                    .strip('"')
-                                    .lower()
+                                    node_text(arg, source).strip("'").strip('"').lower()
                                 )
                                 if is_known_class_or_struct(raw):
                                     return raw
@@ -1089,9 +1081,7 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                     for field_name in ("left", "value"):
                         f_node = n.child_by_field_name(field_name)
                         if f_node and f_node.type == "identifier":
-                            scope_stack[-1][
-                                node_text(f_node, source).lower()
-                            ] = None
+                            scope_stack[-1][node_text(f_node, source).lower()] = None
 
                     body_node = n.child_by_field_name("body")
                     if body_node:
@@ -1103,15 +1093,13 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                 if n.type == "declaration_statement":
                     t_node = n.child_by_field_name("type")
                     explicit_type = (
-                        node_text(t_node, source).strip("@").lower()
-                        if t_node
-                        else None
+                        node_text(t_node, source).strip("@").lower() if t_node else None
                     )
                     for child in n.children:
                         if child.type == "identifier":
-                            scope_stack[-1][
-                                node_text(child, source).lower()
-                            ] = explicit_type
+                            scope_stack[-1][node_text(child, source).lower()] = (
+                                explicit_type
+                            )
                         elif child.type == "assignment_expression":
                             right = child.child_by_field_name("right")
                             if right:
@@ -1119,9 +1107,41 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                             left = child.child_by_field_name("left")
                             if left and left.type == "identifier":
                                 var_type = explicit_type or resolve_node_type(right)
-                                scope_stack[-1][
-                                    node_text(left, source).lower()
-                                ] = var_type
+                                scope_stack[-1][node_text(left, source).lower()] = (
+                                    var_type
+                                )
+                            elif child.type == "assignment_expression":
+                                right = child.child_by_field_name("right")
+                                if right:
+                                    check_node(right)
+                                left = child.child_by_field_name("left")
+                                if left:
+                                    var_type = explicit_type or resolve_node_type(right)
+                                    if left.type == "identifier":
+                                        scope_stack[-1][
+                                            node_text(left, source).lower()
+                                        ] = var_type
+                                    elif left.type == "array_expression":
+                                        elems = [
+                                            el
+                                            for el in left.children
+                                            if el.type == "identifier"
+                                        ]
+                                        type_parts = (
+                                            [p.strip() for p in var_type.split(",")]
+                                            if var_type and "," in var_type
+                                            else []
+                                        )
+                                        for idx, el in enumerate(elems):
+                                            el_type = (
+                                                type_parts[idx]
+                                                if idx < len(type_parts)
+                                                else var_type
+                                            )
+                                            scope_stack[-1][
+                                                node_text(el, source).lower()
+                                            ] = el_type
+
                     return
 
                 # 5. Локальная константа
@@ -1134,14 +1154,10 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                     name_node = n.child_by_field_name("name")
                     t_node = n.child_by_field_name("type")
                     c_type = (
-                        node_text(t_node, source).strip("@").lower()
-                        if t_node
-                        else None
+                        node_text(t_node, source).strip("@").lower() if t_node else None
                     )
                     if name_node:
-                        scope_stack[-1][
-                            node_text(name_node, source).lower()
-                        ] = c_type
+                        scope_stack[-1][node_text(name_node, source).lower()] = c_type
                     return
 
                 # 6. Обращение через точку: obj.member
@@ -1366,9 +1382,7 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> types.Hover | None:
     if not node:
         return None
 
-    target_key = (
-        node_text(node, doc.source).strip('"').strip("'").lower()
-    )
+    target_key = node_text(node, doc.source).strip('"').strip("'").lower()
 
     # Checking whether the word under the cursor is a class member following a dot (for example: MyLibrary.GetInstance)
     filtered_entries: list[SymbolInfo] | None = None
@@ -1438,9 +1452,7 @@ def goto_definition(
             return None
         curr = curr.parent
 
-    target_key = (
-        node_text(node, doc.source).strip('"').strip("'").lower()
-    )
+    target_key = node_text(node, doc.source).strip('"').strip("'").lower()
     if not target_key:
         return None
 
@@ -1469,10 +1481,7 @@ def goto_definition(
         )
         if param_list:
             for n_node in param_list.children_by_field_name("name"):
-                if (
-                    node_text(n_node, doc.source).lower()
-                    == target_key
-                ):
+                if node_text(n_node, doc.source).lower() == target_key:
                     return types.Location(uri=doc.uri, range=node_to_range(n_node))
 
         # 3b. Локальные переменные и константы внутри метода
@@ -1487,8 +1496,7 @@ def goto_definition(
                 for child in n.children:
                     if (
                         child.type == "identifier"
-                        and node_text(child, doc.source).lower()
-                        == target_key
+                        and node_text(child, doc.source).lower() == target_key
                     ):
                         found_local = child
                         return
@@ -1497,19 +1505,14 @@ def goto_definition(
                         if (
                             left
                             and left.type == "identifier"
-                            and node_text(left, doc.source).lower()
-                            == target_key
+                            and node_text(left, doc.source).lower() == target_key
                         ):
                             found_local = left
                             return
 
             elif n.type in ("const_definition", "const_array_definition"):
                 name_node = n.child_by_field_name("name")
-                if (
-                    name_node
-                    and node_text(name_node, doc.source).lower()
-                    == target_key
-                ):
+                if name_node and node_text(name_node, doc.source).lower() == target_key:
                     found_local = name_node
                     return
 
@@ -1519,8 +1522,7 @@ def goto_definition(
                     if (
                         f_node
                         and f_node.type == "identifier"
-                        and node_text(f_node, doc.source).lower()
-                        == target_key
+                        and node_text(f_node, doc.source).lower() == target_key
                     ):
                         found_local = f_node
                         return
