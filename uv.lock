@@ -356,7 +356,7 @@ wheels = [
 [[package]]
 name = "tree-sitter-zscript"
 version = "0.1.0"
-source = { git = "https://github.com/kuroneko1996/tree-sitter-zscript#e8397e75fc8c6ae8128c46459c4baf5fa7687008" }
+source = { git = "https://github.com/kuroneko1996/tree-sitter-zscript#9082a601885fed288f5d2f45d39dc74de12b3651" }
 
 [[package]]
 name = "typing-extensions"
@@ -369,7 +369,7 @@ wheels = [
 
 [[package]]
 name = "zscript-lsp"
-version = "0.1.0"
+version = "0.1.1"
 source = { virtual = "." }
 dependencies = [
     { name = "pygls" },
