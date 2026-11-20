@@ -551,10 +551,7 @@ def index_source(
                 )
             if flag_node:
                 raw_flag = node_text(flag_node, source)
-                # Если имя в flagdef указано без префикса 'b' (например Solid), добавляем 'b' -> bSolid
-                full_flag = (
-                    raw_flag if raw_flag.lower().startswith("b") else f"b{raw_flag}"
-                )
+                full_flag = f"b{raw_flag}"
                 key = full_flag.lower()
                 owner_info = find_owner_node(node)
                 owner_name = owner_info[1] if owner_info else None
