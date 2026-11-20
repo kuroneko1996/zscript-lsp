@@ -1,6 +1,6 @@
 [project]
 name = "zscript-lsp"
-version = "0.1.0"
+version = "0.1.1"
 description = "ZScript language server"
 readme = "README.md"
 authors = [
