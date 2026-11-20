@@ -67,6 +67,10 @@ class_parents: dict[str, str] = {}
 file_symbols: dict[str, set[str]] = {}
 file_classes: dict[str, set[str]] = {}
 
+def node_text(node: Node, source: str) -> str:
+    source_bytes = bytes(source, "utf-8")
+    return source_bytes[node.start_byte : node.end_byte].decode("utf-8", errors="ignore")
+
 
 def index_pk3(pk3_path_str: str) -> None:
     """Читает все ZScript-файлы напрямую из ZIP/PK3 архива движка."""
@@ -221,7 +225,7 @@ def build_semantic_tokens(source: str) -> list[int]:
                 "function_expression",
                 "member_access_expression",
             ):
-                ident_lower = source[node.start_byte : node.end_byte].lower()
+                ident_lower = node_text(node, source).lower()
                 entries = symbol_index.get(ident_lower)
                 if entries:
                     kind = entries[0].kind
@@ -329,7 +333,12 @@ def extract_signature(node: Node, source: str) -> str:
             end_byte = child.start_byte
             break
 
-    sig = " ".join(source[node.start_byte : end_byte].split())
+    source_bytes = bytes(source, "utf-8")
+    sig = " ".join(
+        source_bytes[node.start_byte : end_byte]
+        .decode("utf-8", errors="ignore")
+        .split()
+    )
 
     if node.type in ("method_declaration", "variable_declaration"):
         sig += ";"
@@ -379,13 +388,13 @@ def index_source(
         decl_node: Node,
         kind: types.CompletionItemKind,
     ) -> None:
-        orig_name = source[name_node.start_byte : name_node.end_byte]
+        orig_name = node_text(name_node, source)
         key = orig_name.lower()
         owner_info = find_owner_node(decl_node)
         owner_name = owner_info[1] if owner_info else None
         type_node = decl_node.child_by_field_name("type")
         type_name = (
-            source[type_node.start_byte : type_node.end_byte].strip("@").lower()
+            node_text(type_node, source).strip("@").lower()
             if type_node
             else None
         )
@@ -422,7 +431,7 @@ def index_source(
         if node.type == "include_definition":
             path_node = node.child_by_field_name("path")
             if path_node:
-                inc_text = source[path_node.start_byte : path_node.end_byte]
+                inc_text = node_text(path_node, source)
                 target_file = resolve_include_path(workspace_root, uri, inc_text)
                 if target_file:
                     target_uri = target_file.as_uri()
@@ -436,18 +445,28 @@ def index_source(
                             )
                         except OSError:
                             pass
+        elif node.type in ("const_definition", "const_array_definition"):
+            const_name = name_node
+            if not const_name:
+                for ch in node.children:
+                    if ch.type == "identifier":
+                        const_name = ch
+                        break
+                    if ch.type == "assignment_expression":
+                        left = ch.child_by_field_name("left")
+                        if left and left.type == "identifier":
+                            const_name = left
+                            break
+            if const_name:
+                add_symbol(const_name, node, types.CompletionItemKind.Constant)
         elif name_node:
             match node.type:
                 case "class_definition":
                     inherit_node = node.child_by_field_name("inherit")
                     if name_node and inherit_node and inherit_node.next_named_sibling:
-                        cls_key = source[
-                            name_node.start_byte : name_node.end_byte
-                        ].lower()
+                        cls_key = node_text(name_node, source).lower()
                         parent_node = inherit_node.next_named_sibling
-                        parent_key = source[
-                            parent_node.start_byte : parent_node.end_byte
-                        ].lower()
+                        parent_key = node_text(parent_node, source).lower()
                         class_parents[cls_key] = parent_key
                     add_symbol(name_node, node, types.CompletionItemKind.Class)
                 case "struct_definition":
@@ -461,8 +480,6 @@ def index_source(
                     if find_owner_node(node):
                         for child in node.children_by_field_name("name"):
                             add_symbol(child, node, types.CompletionItemKind.Variable)
-                case "const_definition" | "const_array_definition":
-                    add_symbol(name_node, node, types.CompletionItemKind.Constant)
                 case "enum_declaration_value":
                     add_symbol(name_node, node, types.CompletionItemKind.EnumMember)
                 case "state_label":
@@ -498,7 +515,7 @@ def collect_visible_locals(
     if owner_node:
         name_node = owner_node.child_by_field_name("name")
         if name_node:
-            cls_lower = source[name_node.start_byte : name_node.end_byte].lower()
+            cls_lower = node_text(name_node, source).lower()
             for m in get_members_with_inheritance(cls_lower):
                 key = m.orig_name.lower()
                 if key not in seen:
@@ -524,11 +541,11 @@ def collect_visible_locals(
         p_types = param_list.children_by_field_name("type")
         p_names = param_list.children_by_field_name("name")
         for t_node, n_node in zip(p_types, p_names):
-            orig = source[n_node.start_byte : n_node.end_byte]
+            orig = node_text(n_node, source)
             key = orig.lower()
             if key not in seen:
                 seen.add(key)
-                t_str = source[t_node.start_byte : t_node.end_byte]
+                t_str = node_text(t_node, source)
                 items.append(
                     types.CompletionItem(
                         label=orig,
@@ -543,10 +560,10 @@ def collect_visible_locals(
             return
         if n.type == "declaration_statement":
             t_node = n.child_by_field_name("type")
-            t_str = source[t_node.start_byte : t_node.end_byte] if t_node else "let"
+            t_str = node_text(t_node, source) if t_node else "let"
             for child in n.children:
                 if child.type == "identifier":
-                    orig = source[child.start_byte : child.end_byte]
+                    orig = node_text(child, source)
                     key = orig.lower()
                     if key not in seen:
                         seen.add(key)
@@ -560,7 +577,7 @@ def collect_visible_locals(
                 elif child.type == "assignment_expression":
                     left = child.child_by_field_name("left")
                     if left and left.type == "identifier":
-                        orig = source[left.start_byte : left.end_byte]
+                        orig = node_text(left, source)
                         key = orig.lower()
                         if key not in seen:
                             seen.add(key)
@@ -575,7 +592,7 @@ def collect_visible_locals(
             for f_name in ("left", "value"):
                 f_node = n.child_by_field_name(f_name)
                 if f_node and f_node.type == "identifier":
-                    orig = source[f_node.start_byte : f_node.end_byte]
+                    orig = node_text(f_node, source)
                     key = orig.lower()
                     if key not in seen:
                         seen.add(key)
@@ -647,7 +664,7 @@ def infer_rhs_type(
     ) or expr_node.child_by_field_name("type")
     if not fn_node:
         return None
-    fn_name = source[fn_node.start_byte : fn_node.end_byte].lower()
+    fn_name = node_text(fn_node, source).lower()
 
     # 1. new("MyLibrary") or MyLibrary(arg)
     if fn_name == "new":
@@ -655,7 +672,7 @@ def infer_rhs_type(
             "argument"
         ) or expr_node.children_by_field_name("target")
         for arg in args:
-            raw = source[arg.start_byte : arg.end_byte].strip("'").strip('"').lower()
+            raw = node_text(arg, source).strip("'").strip('"').lower()
             if raw in class_members or raw in symbol_index:
                 return raw
     elif fn_name in class_members or fn_name in symbol_index:
@@ -666,8 +683,8 @@ def infer_rhs_type(
         obj_node = fn_node.children[0] if fn_node.children else None
         mem_node = fn_node.child_by_field_name("member")
         if obj_node and mem_node:
-            obj_name = source[obj_node.start_byte : obj_node.end_byte].lower()
-            mem_name = source[mem_node.start_byte : mem_node.end_byte].lower()
+            obj_name = node_text(obj_node, source).lower()
+            mem_name = node_text(mem_node, source).lower()
             owner_type = current_class if obj_name == "self" else obj_name
             for m in get_members_with_inheritance(owner_type or ""):
                 if m.orig_name.lower() == mem_name and m.type_name:
@@ -719,7 +736,7 @@ def resolve_identifier_type(
     if owner_node:
         name_node = owner_node.child_by_field_name("name")
         if name_node:
-            current_class = source[name_node.start_byte : name_node.end_byte].lower()
+            current_class = node_text(name_node, source).lower()
 
     # 2. Process self and super
     if ident_lower == "self":
@@ -737,9 +754,9 @@ def resolve_identifier_type(
             p_types = param_list.children_by_field_name("type")
             p_names = param_list.children_by_field_name("name")
             for t_node, n_node in zip(p_types, p_names):
-                if source[n_node.start_byte : n_node.end_byte].lower() == ident_lower:
+                if node_text(n_node, source).lower() == ident_lower:
                     return (
-                        source[t_node.start_byte : t_node.end_byte].strip("@").lower()
+                        node_text(t_node, source).strip("@").lower()
                     )
 
         # 3b. Local variables inside the method (including 'let')
@@ -748,12 +765,12 @@ def resolve_identifier_type(
                 t_node = n.child_by_field_name("type")
                 if t_node:
                     t_str = (
-                        source[t_node.start_byte : t_node.end_byte].strip("@").lower()
+                        node_text(t_node, source).strip("@").lower()
                     )
                     for child in n.children:
                         if (
                             child.type == "identifier"
-                            and source[child.start_byte : child.end_byte].lower()
+                            and node_text(child, source).lower()
                             == ident_lower
                         ):
                             return t_str
@@ -761,7 +778,7 @@ def resolve_identifier_type(
                             left = child.child_by_field_name("left")
                             if (
                                 left
-                                and source[left.start_byte : left.end_byte].lower()
+                                and node_text(left, source).lower()
                                 == ident_lower
                             ):
                                 return t_str
@@ -774,7 +791,7 @@ def resolve_identifier_type(
                             if not left or not right:
                                 continue
                             if (
-                                source[left.start_byte : left.end_byte].lower()
+                                node_text(left, source).lower()
                                 == ident_lower
                             ):
                                 return infer_rhs_type(right, source, current_class)
@@ -787,7 +804,7 @@ def resolve_identifier_type(
 
         local_type = scan_locals(current_method)
         if not local_type and current_method:
-            method_text = source[current_method.start_byte : current_method.end_byte]
+            method_text = node_text(current_method, source)
             # Ищем "let shotgunner = new("ShotgunGuy")" или "ShotgunGuy shotgunner"
             m_new = re.search(
                 rf"\blet\s+{re.escape(ident_lower)}\s*=\s*new\s*\(\s*['\"]([^'\"]+)['\"]\s*\)",
@@ -840,24 +857,24 @@ def collect_declared_names(method_node: Node, source: str) -> set[str]:
     )
     if param_list:
         for n_node in param_list.children_by_field_name("name"):
-            declared.add(source[n_node.start_byte : n_node.end_byte].lower())
+            declared.add(node_text(n_node, source).lower())
 
     # 2. Local variables (including let, for, and foreach)
     def walk_decls(n: Node) -> None:
         if n.type == "declaration_statement":
             for child in n.children:
                 if child.type == "identifier":
-                    declared.add(source[child.start_byte : child.end_byte].lower())
+                    declared.add(node_text(child, source).lower())
                 elif child.type == "assignment_expression":
                     left = child.child_by_field_name("left")
                     if left and left.type == "identifier":
-                        declared.add(source[left.start_byte : left.end_byte].lower())
+                        declared.add(node_text(left, source).lower())
 
         elif n.type == "foreach_statement":
             for field_name in ("left", "value"):
                 f_node = n.child_by_field_name(field_name)
                 if f_node and f_node.type == "identifier":
-                    declared.add(source[f_node.start_byte : f_node.end_byte].lower())
+                    declared.add(node_text(f_node, source).lower())
 
         for ch in n.children:
             walk_decls(ch)
@@ -939,7 +956,7 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
         if node.type in ("class_definition", "struct_definition"):
             name_node = node.child_by_field_name("name")
             cls_name = (
-                source[name_node.start_byte : name_node.end_byte].lower()
+                node_text(name_node, source).lower()
                 if name_node
                 else current_class
             )
@@ -979,9 +996,9 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                 p_types = param_list.children_by_field_name("type")
                 p_names = param_list.children_by_field_name("name")
                 for t_node, n_node in zip(p_types, p_names):
-                    p_name = source[n_node.start_byte : n_node.end_byte].lower()
+                    p_name = node_text(n_node, source).lower()
                     p_type = (
-                        source[t_node.start_byte : t_node.end_byte].strip("@").lower()
+                        node_text(t_node, source).strip("@").lower()
                     )
                     base_scope[p_name] = p_type
 
@@ -1000,7 +1017,7 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
 
                 if expr.type == "identifier":
                     _, var_type = lookup_var(
-                        source[expr.start_byte : expr.end_byte].lower()
+                        node_text(expr, source).lower()
                     )
                     return var_type
 
@@ -1011,14 +1028,14 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                     if not fn_node:
                         return None
                     if fn_node.type == "identifier":
-                        fn_name = source[fn_node.start_byte : fn_node.end_byte].lower()
+                        fn_name = node_text(fn_node, source).lower()
                         if fn_name == "new":
                             args = expr.children_by_field_name(
                                 "argument"
                             ) or expr.children_by_field_name("target")
                             for arg in args:
                                 raw = (
-                                    source[arg.start_byte : arg.end_byte]
+                                    node_text(arg, source)
                                     .strip("'")
                                     .strip('"')
                                     .lower()
@@ -1038,9 +1055,7 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                     mem_node = expr.child_by_field_name("member")
                     owner_type = resolve_node_type(obj_node)
                     if owner_type and mem_node:
-                        mem_name = source[
-                            mem_node.start_byte : mem_node.end_byte
-                        ].lower()
+                        mem_name = node_text(mem_node, source).lower()
                         for m in get_members_with_inheritance(owner_type):
                             if m.orig_name.lower() == mem_name:
                                 return m.type_name
@@ -1075,7 +1090,7 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                         f_node = n.child_by_field_name(field_name)
                         if f_node and f_node.type == "identifier":
                             scope_stack[-1][
-                                source[f_node.start_byte : f_node.end_byte].lower()
+                                node_text(f_node, source).lower()
                             ] = None
 
                     body_node = n.child_by_field_name("body")
@@ -1088,14 +1103,14 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                 if n.type == "declaration_statement":
                     t_node = n.child_by_field_name("type")
                     explicit_type = (
-                        source[t_node.start_byte : t_node.end_byte].strip("@").lower()
+                        node_text(t_node, source).strip("@").lower()
                         if t_node
                         else None
                     )
                     for child in n.children:
                         if child.type == "identifier":
                             scope_stack[-1][
-                                source[child.start_byte : child.end_byte].lower()
+                                node_text(child, source).lower()
                             ] = explicit_type
                         elif child.type == "assignment_expression":
                             right = child.child_by_field_name("right")
@@ -1105,7 +1120,7 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                             if left and left.type == "identifier":
                                 var_type = explicit_type or resolve_node_type(right)
                                 scope_stack[-1][
-                                    source[left.start_byte : left.end_byte].lower()
+                                    node_text(left, source).lower()
                                 ] = var_type
                     return
 
@@ -1119,13 +1134,13 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                     name_node = n.child_by_field_name("name")
                     t_node = n.child_by_field_name("type")
                     c_type = (
-                        source[t_node.start_byte : t_node.end_byte].strip("@").lower()
+                        node_text(t_node, source).strip("@").lower()
                         if t_node
                         else None
                     )
                     if name_node:
                         scope_stack[-1][
-                            source[name_node.start_byte : name_node.end_byte].lower()
+                            node_text(name_node, source).lower()
                         ] = c_type
                     return
 
@@ -1149,9 +1164,7 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                             and is_known_class_or_struct(owner_type)
                             and target_mem.type == "identifier"
                         ):
-                            orig_mem = source[
-                                target_mem.start_byte : target_mem.end_byte
-                            ]
+                            orig_mem = node_text(target_mem, source)
                             mem_lower = orig_mem.lower()
                             members = get_members_with_inheritance(owner_type)
                             if not any(
@@ -1169,7 +1182,7 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
 
                 # 7. Обычный идентификатор
                 if n.type == "identifier" and not is_ignored_identifier(n):
-                    orig_text = source[n.start_byte : n.end_byte]
+                    orig_text = node_text(n, source)
                     found, _ = lookup_var(orig_text.lower())
                     if not found:
                         extra_diagnostics.append(
@@ -1354,7 +1367,7 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> types.Hover | None:
         return None
 
     target_key = (
-        doc.source[node.start_byte : node.end_byte].strip('"').strip("'").lower()
+        node_text(node, doc.source).strip('"').strip("'").lower()
     )
 
     # Checking whether the word under the cursor is a class member following a dot (for example: MyLibrary.GetInstance)
@@ -1364,7 +1377,7 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> types.Hover | None:
         member_node = parent.child_by_field_name("member")
         if member_node and member_node.id == node.id and parent.children:
             obj_node = parent.children[0]
-            obj_ident = doc.source[obj_node.start_byte : obj_node.end_byte].lower()
+            obj_ident = node_text(obj_node, doc.source).lower()
             resolved_owner = resolve_identifier_type(obj_ident, doc.source, point)
             if resolved_owner:
                 # Search for a method/field only in the inheritanche chain of this class
@@ -1411,7 +1424,7 @@ def goto_definition(
         if curr.type == "include_definition":
             path_node = curr.child_by_field_name("path")
             if path_node:
-                inc_text = doc.source[path_node.start_byte : path_node.end_byte]
+                inc_text = node_text(path_node, doc.source)
                 root = get_workspace_root_for_uri(ls, doc.uri)
                 target_file = resolve_include_path(root, doc.uri, inc_text)
                 if target_file:
@@ -1426,7 +1439,7 @@ def goto_definition(
         curr = curr.parent
 
     target_key = (
-        doc.source[node.start_byte : node.end_byte].strip('"').strip("'").lower()
+        node_text(node, doc.source).strip('"').strip("'").lower()
     )
     if not target_key:
         return None
@@ -1437,7 +1450,7 @@ def goto_definition(
         member_node = parent.child_by_field_name("member")
         if member_node and member_node.id == node.id and parent.children:
             obj_node = parent.children[0]
-            obj_ident = doc.source[obj_node.start_byte : obj_node.end_byte].lower()
+            obj_ident = node_text(obj_node, doc.source).lower()
             resolved_owner = resolve_identifier_type(obj_ident, doc.source, point)
             if resolved_owner:
                 members = get_members_with_inheritance(resolved_owner)
@@ -1457,7 +1470,7 @@ def goto_definition(
         if param_list:
             for n_node in param_list.children_by_field_name("name"):
                 if (
-                    doc.source[n_node.start_byte : n_node.end_byte].lower()
+                    node_text(n_node, doc.source).lower()
                     == target_key
                 ):
                     return types.Location(uri=doc.uri, range=node_to_range(n_node))
@@ -1474,7 +1487,7 @@ def goto_definition(
                 for child in n.children:
                     if (
                         child.type == "identifier"
-                        and doc.source[child.start_byte : child.end_byte].lower()
+                        and node_text(child, doc.source).lower()
                         == target_key
                     ):
                         found_local = child
@@ -1484,7 +1497,7 @@ def goto_definition(
                         if (
                             left
                             and left.type == "identifier"
-                            and doc.source[left.start_byte : left.end_byte].lower()
+                            and node_text(left, doc.source).lower()
                             == target_key
                         ):
                             found_local = left
@@ -1494,7 +1507,7 @@ def goto_definition(
                 name_node = n.child_by_field_name("name")
                 if (
                     name_node
-                    and doc.source[name_node.start_byte : name_node.end_byte].lower()
+                    and node_text(name_node, doc.source).lower()
                     == target_key
                 ):
                     found_local = name_node
@@ -1506,7 +1519,7 @@ def goto_definition(
                     if (
                         f_node
                         and f_node.type == "identifier"
-                        and doc.source[f_node.start_byte : f_node.end_byte].lower()
+                        and node_text(f_node, doc.source).lower()
                         == target_key
                     ):
                         found_local = f_node

@@ -8,6 +8,7 @@ default
 invoker
 state
 players
+player
 consoleplayer
 netgame
 multiplayer
@@ -44,3 +45,7 @@ vector3
 color
 textureid
 font
+frandom
+random
+cos
+sin

@@ -356,7 +356,7 @@ wheels = [
 [[package]]
 name = "tree-sitter-zscript"
 version = "0.1.0"
-source = { git = "https://github.com/kuroneko1996/tree-sitter-zscript#5cfd227599061a0b482699edbf7858bcdb987658" }
+source = { git = "https://github.com/kuroneko1996/tree-sitter-zscript#76a87eadc163784c9465417de9a496529dc3b60b" }
 
 [[package]]
 name = "typing-extensions"
