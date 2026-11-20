@@ -7,6 +7,7 @@ false
 default
 invoker
 state
+stateinfo
 players
 player
 consoleplayer
@@ -47,5 +48,17 @@ textureid
 font
 frandom
 random
+Random2
+abs
+clamp
 cos
 sin
+atan2
+GetDefaultByType
+ACS_Execute
+ACS_ExecuteAlways
+ACS_ExecuteWithResult
+ACS_Suspend
+ACS_Terminate
+ACS_LockedExecute
+ACS_LockedExecuteDoor

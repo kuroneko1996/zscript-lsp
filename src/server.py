@@ -1104,6 +1104,12 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                             scope_stack[-1][node_text(child, source).lower()] = (
                                 explicit_type
                             )
+                        elif child.type == "subscript_expression":
+                            arr_name = child.children[0] if child.children else None
+                            if arr_name and arr_name.type == "identifier":
+                                scope_stack[-1][
+                                    node_text(arr_name, source).lower()
+                                ] = explicit_type
                         elif child.type == "assignment_expression":
                             right = child.child_by_field_name("right")
                             if right:
