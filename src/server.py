@@ -89,7 +89,7 @@ def index_pk3(pk3_path_str: str) -> None:
             name
             for name in all_names
             if name.lower().startswith("zscript")
-            and name.lower().endswith((".zs", ".zsc", ".zscript"))
+            and name.lower().endswith((".zs", ".zsc", ".zscript", ".zc"))
         ]
 
         for entry_name in zscript_entries:
@@ -133,6 +133,56 @@ def apply_settings(raw_settings: object, ls: LanguageServer) -> None:
     )
 
 
+def load_object_methods() -> None:
+    builtin_object_methods = [
+        (
+            "GetClass",
+            "class GetClass() const;",
+            "class",
+            types.CompletionItemKind.Method,
+        ),
+        (
+            "GetClassName",
+            "name GetClassName() const;",
+            "name",
+            types.CompletionItemKind.Method,
+        ),
+        (
+            "GetParentClass",
+            "class GetParentClass() const;",
+            "class",
+            types.CompletionItemKind.Method,
+        ),
+        ("Destroy", "virtual void Destroy();", "void", types.CompletionItemKind.Method),
+        (
+            "bDestroyed",
+            "readonly bool bDestroyed;",
+            "bool",
+            types.CompletionItemKind.Property,
+        ),
+    ]
+    existing_obj = {m.orig_name.lower() for m in class_members.get("object", [])}
+    for m_name, m_sig, m_type, m_kind in builtin_object_methods:
+        if m_name.lower() not in existing_obj:
+            class_members.setdefault("object", []).append(
+                SymbolInfo(
+                    orig_name=m_name,
+                    kind=m_kind,
+                    uri="builtin://object",
+                    location=types.Location(
+                        uri="builtin://object",
+                        range=types.Range(
+                            start=types.Position(line=0, character=0),
+                            end=types.Position(line=0, character=0),
+                        ),
+                    ),
+                    signature=f"class Object {{\n    {m_sig}\n}}",
+                    owner="Object",
+                    type_name=m_type,
+                )
+            )
+
+
 def load_actors_builtin_actor_flags() -> None:
     flags_path = Path(__file__).parent / "builtin_actor_flags.txt"
     if flags_path.is_file():
@@ -148,7 +198,11 @@ def load_actors_builtin_actor_flags() -> None:
             if not flag_name:
                 continue
             # Красивый регистр: bDropped (если в файле в нижнем регистре)
-            orig = f"b{flag_name[1:].capitalize()}" if flag_name.startswith("b") else flag_name
+            orig = (
+                f"b{flag_name[1:].capitalize()}"
+                if flag_name.startswith("b")
+                else flag_name
+            )
             info = SymbolInfo(
                 orig_name=orig,
                 kind=types.CompletionItemKind.Property,
@@ -159,7 +213,6 @@ def load_actors_builtin_actor_flags() -> None:
                 type_name="bool",
             )
             class_members.setdefault("actor", []).append(info)
-
 
 
 def build_semantic_tokens(source: str) -> list[int]:
@@ -493,11 +546,15 @@ def index_source(
             flag_node = name_node or node.child_by_field_name("flag")
             if not flag_node:
                 # Берём первый identifier внутри flagdef (например, Solid из "flagdef Solid: flags, 0;")
-                flag_node = next((ch for ch in node.children if ch.type == "identifier"), None)
+                flag_node = next(
+                    (ch for ch in node.children if ch.type == "identifier"), None
+                )
             if flag_node:
                 raw_flag = node_text(flag_node, source)
                 # Если имя в flagdef указано без префикса 'b' (например Solid), добавляем 'b' -> bSolid
-                full_flag = raw_flag if raw_flag.lower().startswith("b") else f"b{raw_flag}"
+                full_flag = (
+                    raw_flag if raw_flag.lower().startswith("b") else f"b{raw_flag}"
+                )
                 key = full_flag.lower()
                 owner_info = find_owner_node(node)
                 owner_name = owner_info[1] if owner_info else None
@@ -1166,9 +1223,9 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                         elif child.type == "subscript_expression":
                             arr_name = child.children[0] if child.children else None
                             if arr_name and arr_name.type == "identifier":
-                                scope_stack[-1][
-                                    node_text(arr_name, source).lower()
-                                ] = explicit_type
+                                scope_stack[-1][node_text(arr_name, source).lower()] = (
+                                    explicit_type
+                                )
                         elif child.type == "assignment_expression":
                             right = child.child_by_field_name("right")
                             if right:
@@ -1318,7 +1375,7 @@ def on_initialized(ls: LanguageServer, params: types.InitializedParams) -> None:
             for line in identifiers_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
-
+        load_object_methods()
         load_actors_builtin_actor_flags()
     except OSError as err:
         ls.window_show_message(
