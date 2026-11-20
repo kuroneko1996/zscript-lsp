@@ -12,7 +12,7 @@ from tree_sitter import Language, Node, Parser
 ZSCRIPT_LANGUAGE = Language(tszscript.language())
 parser = Parser(ZSCRIPT_LANGUAGE)
 
-server = LanguageServer("zscript-lsp", "0.1.0")
+server = LanguageServer("zscript-lsp", "0.1.1")
 
 keywords: list[str]
 builtin_identifiers: list[str]
@@ -183,6 +183,30 @@ def load_object_methods() -> None:
             )
 
 
+def register_builtin_zscript_members() -> None:
+    """Регистрирует встроенные системные свойства движка ZScript, отсутствующие в .zs."""
+    builtin_loc = types.Location(
+        uri="builtin://zscript",
+        range=types.Range(
+            start=types.Position(line=0, character=0),
+            end=types.Position(line=0, character=0),
+        ),
+    )
+    default_prop = SymbolInfo(
+        orig_name="Default",
+        kind=types.CompletionItemKind.Property,
+        uri="builtin://zscript",
+        location=builtin_loc,
+        signature="readonly<Actor> Default",
+        owner="actor",
+        type_name="actor",
+    )
+    existing = [m.orig_name.lower() for m in class_members.get("actor", [])]
+    if "default" not in existing:
+        class_members.setdefault("actor", []).append(default_prop)
+        symbol_index.setdefault("default", []).append(default_prop)
+
+
 def load_actors_builtin_actor_flags() -> None:
     flags_path = Path(__file__).parent / "builtin_actor_flags.txt"
     if flags_path.is_file():
@@ -333,7 +357,7 @@ def build_semantic_tokens(source: str) -> list[int]:
     walk(tree.root_node)
 
     # Сортируем токены строго по позиции в файле (требование спецификации LSP)
-    raw_tokens.sort(key=lambda t: (t, t))
+    raw_tokens.sort(key=lambda t: (t[0], t[1]))
 
     # Кодируем в относительные смещения (delta_line, delta_start, length, type, modifiers)
     encoded: list[int] = []
@@ -1165,6 +1189,8 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                     owner_type = resolve_node_type(obj_node)
                     if owner_type and mem_node:
                         mem_name = node_text(mem_node, source).lower()
+                        if mem_name == "default":
+                            return owner_type
                         for m in get_members_with_inheritance(owner_type):
                             if m.orig_name.lower() == mem_name:
                                 return m.type_name
@@ -1290,7 +1316,6 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
 
                     mem_node = n.child_by_field_name("member")
                     if mem_node:
-                        # Если справа вложена ещё одна точка (a.b.c), берём левый идентификатор b
                         target_mem = (
                             mem_node.children[0]
                             if mem_node.type == "member_access_expression"
@@ -1317,6 +1342,48 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                                     )
                                 )
                                 return
+
+                        # Если справа вложена ещё одна точка (например, owner.Default.Height) — проверяем хвост цепочки
+                        if mem_node.type == "member_access_expression":
+                            next_obj_type = (
+                                owner_type
+                                if target_mem.type == "identifier"
+                                and node_text(target_mem, source).lower() == "default"
+                                else next(
+                                    (
+                                        m.type_name
+                                        for m in get_members_with_inheritance(
+                                            owner_type or ""
+                                        )
+                                        if m.orig_name.lower()
+                                        == node_text(target_mem, source).lower()
+                                    ),
+                                    None,
+                                )
+                            )
+                            tail_mem = mem_node.child_by_field_name("member")
+                            if (
+                                next_obj_type
+                                and is_known_class_or_struct(next_obj_type)
+                                and tail_mem
+                                and tail_mem.type == "identifier"
+                            ):
+                                tail_orig = node_text(tail_mem, source)
+                                tail_lower = tail_orig.lower()
+                                tail_members = get_members_with_inheritance(
+                                    next_obj_type
+                                )
+                                if not any(
+                                    m.orig_name.lower() == tail_lower
+                                    for m in tail_members
+                                ):
+                                    extra_diagnostics.append(
+                                        types.Diagnostic(
+                                            range=node_to_range(tail_mem),
+                                            message=f"Unknown member '{tail_orig}' on type '{next_obj_type}'",
+                                            severity=types.DiagnosticSeverity.Error,
+                                        )
+                                    )
                     return
 
                 # 7. Обычный идентификатор
@@ -1373,6 +1440,7 @@ def on_initialized(ls: LanguageServer, params: types.InitializedParams) -> None:
             if line.strip()
         ]
         load_object_methods()
+        register_builtin_zscript_members()
         load_actors_builtin_actor_flags()
     except OSError as err:
         ls.window_show_message(
@@ -1387,6 +1455,7 @@ def on_initialized(ls: LanguageServer, params: types.InitializedParams) -> None:
 
         # Check for root file
         for root_entry in (
+            "zscript",
             "zscript.zs",
             "zscript.zsc",
             "zscript.zscript",

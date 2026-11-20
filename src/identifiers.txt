@@ -1149,10 +1149,12 @@ r_visibility
 radius_quake
 random
 random2
+randompick
 reverbedit_id1
 reverbedit_id2
 reverbedit_name
 reverbsavename
+round
 s_sound
 s_startsound
 save_dir
@@ -1255,6 +1257,7 @@ snd_superstereowidth
 snd_waterreverb
 sound
 splashfactor
+sqrt
 st_oldouch
 st_scale
 stairs_builddown
@@ -1461,6 +1464,7 @@ var_friction
 var_pushers
 vector2
 vector3
+vectorangle
 vid_activeinbackground
 vid_adapter
 vid_allowtrueultrawide
