@@ -928,11 +928,15 @@ def is_ignored_identifier(node: Node) -> bool:
         if (left and left.id == node.id) or (val and val.id == node.id):
             return True
 
-    # Именованный аргумент функции: func(alpha: 0.5)
-    if parent.type == "_function_expression_argument":
-        name_node = parent.child_by_field_name("name")
-        if name_node and name_node.id == node.id:
-            return True
+    # Именованный аргумент функции: func(force: true)
+    # ruff: disable[SIM103]
+    if (
+        parent.type
+        in ("function_expression", "argument_list", "_function_expression_argument")
+        and node.next_sibling
+        and node.next_sibling.type == ":"
+    ):
+        return True
 
     return False
 
