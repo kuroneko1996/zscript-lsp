@@ -1,4 +1,5 @@
 import zipfile
+from pathlib import Path
 
 import tree_sitter_zscript as tszscript
 from lsprotocol import types
@@ -27,6 +28,7 @@ type_resolver = TypeResolver(parser=parser, index_manager=index_manager)
 
 keywords: list[str] = []
 builtin_identifiers: list[str] = []
+init_pk3_paths: list[str] = []
 
 
 def apply_settings(raw_settings: object, ls: LanguageServer) -> None:
@@ -44,8 +46,14 @@ def apply_settings(raw_settings: object, ls: LanguageServer) -> None:
     for pk3 in pk3_list:
         if isinstance(pk3, str):
             try:
-                index_manager.index_pk3(pk3)
-                loaded_count += 1
+                if index_manager.index_pk3(pk3):
+                    loaded_count += 1
+                else:
+                    ls.window_show_message(
+                        types.ShowMessageParams(
+                            types.MessageType.Warning, f"PK3 not found: {pk3}"
+                        )
+                    )
             except (zipfile.BadZipfile, OSError) as err:
                 ls.window_show_message(
                     types.ShowMessageParams(types.MessageType.Error, str(err))
@@ -53,7 +61,8 @@ def apply_settings(raw_settings: object, ls: LanguageServer) -> None:
 
     ls.window_show_message(
         types.ShowMessageParams(
-            types.MessageType.Info, f"{loaded_count} pk3(s) loaded."
+            types.MessageType.Info,
+            f"{loaded_count} pk3(s) loaded: " + "\n".join(init_pk3_paths),
         )
     )
 
@@ -70,53 +79,109 @@ def validate_and_index(ls: LanguageServer, uri: str, source: str) -> None:
 
 @server.feature(types.INITIALIZE)
 def on_initialize(ls: LanguageServer, params: types.InitializeParams) -> None:
-    if params.initialization_options:
-        apply_settings(params.initialization_options, ls)
+    global init_pk3_paths, keywords, builtin_identifiers
+
+    # 1. Загружаем встроенные символы и ключевые слова ДО первого didOpen
+    keywords, builtin_identifiers = load_all_builtins(index_manager)
+
+    # 2. Сохраняем пути к pk3 из initializationOptions (Neovim / Zed / Sublime)
+    opts = params.initialization_options or {}
+    if isinstance(opts, dict):
+        pk3s = opts.get("pk3_paths", [])
+        if isinstance(pk3s, list):
+            init_pk3_paths = [p for p in pk3s if isinstance(p, str)]
 
 
 @server.feature(types.INITIALIZED)
 def on_initialized(ls: LanguageServer, params: types.InitializedParams) -> None:
-    global keywords, builtin_identifiers
-    try:
-        keywords, builtin_identifiers = load_all_builtins(index_manager)
-    except OSError as err:
+    # 1. Индексируем pk3, переданные через initializationOptions
+    loaded_count = 0
+    for pk3 in init_pk3_paths:
+        if index_manager.index_pk3(pk3):
+            loaded_count += 1
+        else:
+            ls.window_show_message(
+                types.ShowMessageParams(
+                    types.MessageType.Warning, f"PK3 not found: {pk3}"
+                )
+            )
+
+    if loaded_count > 0:
         ls.window_show_message(
-            types.ShowMessageParams(types.MessageType.Error, str(err))
+            types.ShowMessageParams(
+                types.MessageType.Info,
+                f"{loaded_count} pk3(s) loaded: " + "\n".join(init_pk3_paths),
+            )
         )
 
-    visited_uris: set[str] = set()
+    # 2. Собираем корневые папки проекта (Zed/Sublime -> folders, Neovim -> root_uri)
+    roots: list[Path] = []
     for folder in ls.workspace.folders.values():
-        root_path = uri_to_path(folder.uri).resolve()
+        p = uri_to_path(folder.uri).resolve()
+        if p not in roots:
+            roots.append(p)
+
+    if not roots and ls.workspace.root_uri:
+        p = uri_to_path(ls.workspace.root_uri).resolve()
+        if p not in roots:
+            roots.append(p)
+
+    # 3. Индексируем каждый корень проекта
+    visited_uris: set[str] = set()
+    root_entries = (
+        "zscript.zs",
+        "zscript.zsc",
+        "zscript.zscript",
+        "zscript.txt",
+        "zscript",
+    )
+
+    for root_path in roots:
         if not root_path.exists():
             continue
 
-        for root_entry in (
-            "zscript",
-            "zscript.zs",
-            "zscript.zsc",
-            "zscript.zscript",
-            "zscript.txt",
-        ):
-            entry_file = root_path / root_entry
-            if entry_file.is_file() and entry_file.as_uri() not in visited_uris:
-                try:
-                    text = entry_file.read_text(encoding="utf-8", errors="ignore")
-                    index_manager.index_source(
-                        entry_file.as_uri(), text, root_path, visited_uris
-                    )
-                except OSError:
-                    pass
+        # Автоподхват uzdoom.pk3 / gzdoom.pk3, если лежит в корне проекта
+        for local_pk3 in ("uzdoom.pk3", "gzdoom.pk3"):
+            pk3_candidate = root_path / local_pk3
+            if pk3_candidate.is_file():
+                index_manager.index_pk3(str(pk3_candidate))
 
-        for ext in ("*.zs", "*.zsc", "*.zscript"):
-            for file_path in root_path.rglob(ext):
-                if file_path.as_uri() not in visited_uris:
+        # Сначала проходим по корневым точкам входа и всем их #include
+        for entry_name in root_entries:
+            entry_file = root_path / entry_name
+            if entry_file.is_file():
+                entry_uri = entry_file.as_uri()
+                if entry_uri not in visited_uris:
                     try:
-                        text = file_path.read_text(encoding="utf-8", errors="ignore")
+                        text = entry_file.read_text(encoding="utf-8", errors="ignore")
                         index_manager.index_source(
-                            file_path.as_uri(), text, root_path, visited_uris
+                            uri=entry_uri,
+                            source=text,
+                            workspace_root=root_path,
+                            visited_uris=visited_uris,
                         )
                     except OSError:
                         pass
+
+        # Затем доиндексируем оставшиеся файлы ZScript в папке проекта
+        for ext in ("*.zs", "*.zsc", "*.zscript"):
+            for file_path in root_path.rglob(ext):
+                file_uri = file_path.as_uri()
+                if file_uri not in visited_uris:
+                    try:
+                        text = file_path.read_text(encoding="utf-8", errors="ignore")
+                        index_manager.index_source(
+                            uri=file_uri,
+                            source=text,
+                            workspace_root=root_path,
+                            visited_uris=visited_uris,
+                        )
+                    except OSError:
+                        pass
+
+    # 4. Перепроверяем уже открытые документы (убирает ложные ошибки в Neovim после гонки с didOpen)
+    for doc in list(ls.workspace.text_documents.values()):
+        validate_and_index(ls, doc.uri, doc.source)
 
 
 @server.feature(types.TEXT_DOCUMENT_DID_OPEN)

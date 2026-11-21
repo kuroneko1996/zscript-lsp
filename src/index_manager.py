@@ -148,11 +148,13 @@ class IndexManager:
 
         return diagnostics
 
-    def index_pk3(self, pk3_path_str: str) -> None:
+    def index_pk3(self, pk3_path_str: str) -> bool:
         """Читает все ZScript-файлы напрямую из ZIP/PK3 архива движка."""
         pk3_path = Path(pk3_path_str).expanduser().resolve()
-        if not pk3_path.is_file() or str(pk3_path) in self.indexed_pk3s:
-            return
+        if not pk3_path.is_file():
+            return False
+        if str(pk3_path) in self.indexed_pk3s:
+            return True
 
         self.indexed_pk3s.add(str(pk3_path))
         with zipfile.ZipFile(pk3_path, "r") as zf:
@@ -171,6 +173,8 @@ class IndexManager:
                 # Формируем виртуальный URI вида zip:///C:/.../uzdoom.pk3/zscript/actors/actor.zs
                 virtual_uri = f"zip:///{pk3_path.as_posix().lstrip('/')}/{entry_name}"
                 self.index_source(uri=virtual_uri, source=text)
+
+        return True
 
     def get_members_with_inheritance(self, class_key: str) -> list[SymbolInfo]:
         result: list[SymbolInfo] = []

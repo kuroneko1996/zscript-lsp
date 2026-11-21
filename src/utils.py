@@ -33,13 +33,32 @@ def node_to_range(node: Node) -> types.Range:
 
 def get_workspace_root_for_uri(ls: LanguageServer, uri: str) -> Path | None:
     file_path = uri_to_path(uri).resolve()
+
+    # 1. Проверяем workspace.folders (Zed, Sublime, VS Code)
     for folder in ls.workspace.folders.values():
-        root = uri_to_path(folder.uri).resolve()
-        if root == file_path or root in file_path.parents:
-            return root
-    for folder in ls.workspace.folders.values():
-        return uri_to_path(folder.uri).resolve()
-    return file_path.parent
+        folder_path = uri_to_path(folder.uri).resolve()
+        if folder_path == file_path or folder_path in file_path.parents:
+            return folder_path
+
+    # 2. Проверяем root_uri / root_path (Neovim)
+    if ls.workspace.root_uri:
+        root_path = uri_to_path(ls.workspace.root_uri).resolve()
+        if root_path == file_path or root_path in file_path.parents:
+            return root_path
+
+    # 3. Ищем по маркерам корня вверх от файла
+    for parent in file_path.parents:
+        for marker in (
+            "zscript.zs",
+            "zscript.zsc",
+            "zscript.zscript",
+            "zscript.txt",
+            ".git",
+        ):
+            if (parent / marker).exists():
+                return parent
+
+    return None
 
 
 def resolve_include_path(
