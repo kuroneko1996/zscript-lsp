@@ -5,7 +5,6 @@ from tree_sitter import Node
 
 from index_manager import IndexManager
 from scope import Scope, SymbolEntry
-from symbol_info import SymbolInfo
 from utils import node_text, node_to_range
 
 
@@ -55,25 +54,6 @@ class SemanticValidator:
             else:
                 global_scope.define_symbol(sym_key, first.type_name)
         return global_scope
-
-    def _get_members_with_inheritance(self, class_key: str) -> list[SymbolInfo]:
-        result = []
-        seen_members: set[str] = set()
-        visited_classes: set[str] = set()
-
-        curr = class_key.lower()
-        while curr and curr not in visited_classes:
-            visited_classes.add(curr)
-            for member in self.index_manager.class_members.get(curr, []):
-                m_key = member.orig_name.lower()
-                if m_key not in seen_members:
-                    seen_members.add(m_key)
-                    result.append(member)
-            next_parent = self.index_manager.class_parents.get(curr, "")
-            if not next_parent and curr != "object" and "object" not in visited_classes:
-                next_parent = "object"
-            curr = next_parent
-        return result
 
     def _push_scope(self) -> Scope:
         new_scope = Scope(parent=self.scope_stack[-1])
@@ -136,7 +116,7 @@ class SemanticValidator:
                 mem_name = node_text(mem_node, source).lower()
                 if mem_name == "default":
                     return owner_type
-                for m in self._get_members_with_inheritance(owner_type):
+                for m in self.index_manager.get_members_with_inheritance(owner_type):
                     if m.orig_name.lower() == mem_name:
                         return m.type_name
 
@@ -174,7 +154,9 @@ class SemanticValidator:
             self._define("self", self.current_class)
             parent_cls = self.index_manager.class_parents.get(self.current_class)
             self._define("super", parent_cls)
-            for m in self._get_members_with_inheritance(self.current_class):
+            for m in self.index_manager.get_members_with_inheritance(
+                self.current_class
+            ):
                 self._define(m.orig_name, m.type_name)
 
         # 2. Добавляем параметры метода
@@ -310,7 +292,7 @@ class SemanticValidator:
         ):
             orig_mem = node_text(target_mem, source)
             mem_lower = orig_mem.lower()
-            members = self._get_members_with_inheritance(owner_type)
+            members = self.index_manager.get_members_with_inheritance(owner_type)
             if not any(m.orig_name.lower() == mem_lower for m in members):
                 self.diagnostics.append(
                     types.Diagnostic(
@@ -330,7 +312,9 @@ class SemanticValidator:
                 else next(
                     (
                         m.type_name
-                        for m in self._get_members_with_inheritance(owner_type or "")
+                        for m in self.index_manager.get_members_with_inheritance(
+                            owner_type or ""
+                        )
                         if m.orig_name.lower() == node_text(target_mem, source).lower()
                     ),
                     None,
@@ -345,7 +329,9 @@ class SemanticValidator:
             ):
                 tail_orig = node_text(tail_mem, source)
                 tail_lower = tail_orig.lower()
-                tail_members = self._get_members_with_inheritance(next_obj_type)
+                tail_members = self.index_manager.get_members_with_inheritance(
+                    next_obj_type
+                )
                 if not any(m.orig_name.lower() == tail_lower for m in tail_members):
                     self.diagnostics.append(
                         types.Diagnostic(

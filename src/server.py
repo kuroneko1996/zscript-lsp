@@ -369,7 +369,7 @@ def collect_visible_locals(
         name_node = owner_node.child_by_field_name("name")
         if name_node:
             cls_lower = node_text(name_node, source).lower()
-            for m in get_members_with_inheritance(cls_lower):
+            for m in index_manager.get_members_with_inheritance(cls_lower):
                 key = m.orig_name.lower()
                 if key not in seen:
                     seen.add(key)
@@ -483,27 +483,6 @@ def collect_visible_locals(
     return items
 
 
-def get_members_with_inheritance(class_key: str) -> list[SymbolInfo]:
-    result: list[SymbolInfo] = []
-    seen_members: set[str] = set()
-    visited_classes: set[str] = set()
-
-    curr = class_key.lower()
-    while curr and curr not in visited_classes:
-        visited_classes.add(curr)
-        for member in index_manager.class_members.get(curr, []):
-            m_key = member.orig_name.lower()
-            if m_key not in seen_members:
-                seen_members.add(m_key)
-                result.append(member)
-        next_parent = index_manager.class_parents.get(curr, "")
-        if not next_parent and curr != "object" and "object" not in visited_classes:
-            next_parent = "object"
-        curr = next_parent
-
-    return result
-
-
 def infer_rhs_type(
     expr_node: Node, source: str, current_class: str | None
 ) -> str | None:
@@ -541,7 +520,7 @@ def infer_rhs_type(
             obj_name = node_text(obj_node, source).lower()
             mem_name = node_text(mem_node, source).lower()
             owner_type = current_class if obj_name == "self" else obj_name
-            for m in get_members_with_inheritance(owner_type or ""):
+            for m in index_manager.get_members_with_inheritance(owner_type or ""):
                 if m.orig_name.lower() == mem_name and m.type_name:
                     return m.type_name
 
@@ -668,7 +647,7 @@ def resolve_identifier_type(
             if m_call:
                 cls_n, meth_n = m_call.group(1).lower(), m_call.group(2).lower()
                 owner_t = current_class if cls_n == "self" else cls_n
-                for m in get_members_with_inheritance(owner_t or ""):
+                for m in index_manager.get_members_with_inheritance(owner_t or ""):
                     if m.orig_name.lower() == meth_n and m.type_name:
                         return m.type_name
 
@@ -685,7 +664,7 @@ def resolve_identifier_type(
 
     # 4. Searching among the fields of the current class and its parents
     if current_class:
-        for member in get_members_with_inheritance(current_class):
+        for member in index_manager.get_members_with_inheritance(current_class):
             if member.orig_name.lower() == ident_lower and member.type_name:
                 return member.type_name
 
@@ -805,7 +784,7 @@ def completions(
             point = (params.position.line, params.position.character)
             resolved_type = resolve_identifier_type(owner_ident, doc.source, point)
             target_class = resolved_type or owner_ident
-            members = get_members_with_inheritance(target_class)
+            members = index_manager.get_members_with_inheritance(target_class)
             for m in members:
                 sig_lines = m.signature.splitlines()
                 signature = sig_lines[1].strip() if len(sig_lines) > 1 else m.signature
@@ -870,7 +849,7 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> types.Hover | None:
         obj_ident = node_text(obj_node, doc.source).lower()
         resolved_owner = resolve_identifier_type(obj_ident, doc.source, point)
         if resolved_owner:
-            members = get_members_with_inheritance(resolved_owner)
+            members = index_manager.get_members_with_inheritance(resolved_owner)
             matched = [m for m in members if m.orig_name.lower() == target_key]
             if matched:
                 filtered_entries = matched
@@ -884,7 +863,7 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> types.Hover | None:
                 current_class = node_text(name_node, doc.source).lower()
                 # get_members_with_inheritance идёт от потомка к родителю,
                 # поэтому первый найденный элемент — это метод текущего класса
-                members = get_members_with_inheritance(current_class)
+                members = index_manager.get_members_with_inheritance(current_class)
                 matched = [m for m in members if m.orig_name.lower() == target_key]
                 if matched:
                     filtered_entries = [matched[0]]
@@ -954,7 +933,7 @@ def goto_definition(
             obj_ident = node_text(obj_node, doc.source).lower()
             resolved_owner = resolve_identifier_type(obj_ident, doc.source, point)
             if resolved_owner:
-                members = get_members_with_inheritance(resolved_owner)
+                members = index_manager.get_members_with_inheritance(resolved_owner)
                 matched = [
                     m.location for m in members if m.orig_name.lower() == target_key
                 ]

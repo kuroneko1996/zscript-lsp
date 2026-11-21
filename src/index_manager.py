@@ -129,7 +129,9 @@ class IndexManager:
         diagnostics: list[types.Diagnostic] = []
 
         visitor = ZScriptVisitor(self)
-        visitor.visit_root_node(tree.root_node, source, uri, workspace_root, diagnostics)
+        visitor.visit_root_node(
+            tree.root_node, source, uri, workspace_root, diagnostics
+        )
 
         return diagnostics
 
@@ -156,3 +158,23 @@ class IndexManager:
                 # Формируем виртуальный URI вида zip:///C:/.../uzdoom.pk3/zscript/actors/actor.zs
                 virtual_uri = f"zip:///{pk3_path.as_posix().lstrip('/')}/{entry_name}"
                 self.index_source(uri=virtual_uri, source=text)
+
+    def get_members_with_inheritance(self, class_key: str) -> list[SymbolInfo]:
+        result: list[SymbolInfo] = []
+        seen_members: set[str] = set()
+        visited_classes: set[str] = set()
+
+        curr = class_key.lower()
+        while curr and curr not in visited_classes:
+            visited_classes.add(curr)
+            for member in self.class_members.get(curr, []):
+                m_key = member.orig_name.lower()
+                if m_key not in seen_members:
+                    seen_members.add(m_key)
+                    result.append(member)
+            next_parent = self.class_parents.get(curr, "")
+            if not next_parent and curr != "object" and "object" not in visited_classes:
+                next_parent = "object"
+            curr = next_parent
+
+        return result
