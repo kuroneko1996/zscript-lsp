@@ -1,18 +1,28 @@
 import re
 import zipfile
-from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import unquote, urlparse
 
 import tree_sitter_zscript as tszscript
 from lsprotocol import types
 from pygls.lsp.server import LanguageServer
 from tree_sitter import Language, Node, Parser
 
+from index_manager import IndexManager
+from symbol_info import SymbolInfo
+from utils import (
+    node_text,
+    node_to_range,
+    resolve_include_path,
+    uri_to_path,
+)
+
 ZSCRIPT_LANGUAGE = Language(tszscript.language())
-parser = Parser(ZSCRIPT_LANGUAGE)
+parser: Parser = Parser(ZSCRIPT_LANGUAGE)
 
 server = LanguageServer("zscript-lsp", "0.1.1")
+
+index_manager: IndexManager
+
 
 keywords: list[str]
 builtin_identifiers: list[str]
@@ -44,62 +54,6 @@ TOKEN_MODIFIERS = [
 
 TOKEN_TYPE_INDEX = {name: i for i, name in enumerate(TOKEN_TYPES)}
 
-
-@dataclass
-class SymbolInfo:
-    orig_name: str
-    kind: types.CompletionItemKind
-    uri: str
-    location: types.Location
-    signature: str
-    owner: str | None = None
-    type_name: str | None = None
-
-
-# Global index: { "lower_case_name": [SymbolInfo, ...] }
-symbol_index: dict[str, list[SymbolInfo]] = {}
-# Class index: { "lower_case_class_name": [SymbolInfo, ...] }
-class_members: dict[str, list[SymbolInfo]] = {}
-# Inheritance {"child_class_lower_case": "parent_class_lower_case"}
-class_parents: dict[str, str] = {}
-
-# Links symbols to files for quick clearing or reindexing
-file_symbols: dict[str, set[str]] = {}
-file_classes: dict[str, set[str]] = {}
-
-
-def node_text(node: Node, source: str) -> str:
-    source_bytes = bytes(source, "utf-8")
-    return source_bytes[node.start_byte : node.end_byte].decode(
-        "utf-8", errors="ignore"
-    )
-
-
-def index_pk3(pk3_path_str: str) -> None:
-    """Читает все ZScript-файлы напрямую из ZIP/PK3 архива движка."""
-    pk3_path = Path(pk3_path_str).expanduser().resolve()
-    if not pk3_path.is_file() or str(pk3_path) in indexed_pk3s:
-        return
-
-    indexed_pk3s.add(str(pk3_path))
-    with zipfile.ZipFile(pk3_path, "r") as zf:
-        # Ищем корневой zscript.zs / zscript.txt внутри архива или все .zs/.zsc
-        all_names = zf.namelist()
-        zscript_entries = [
-            name
-            for name in all_names
-            if name.lower().startswith("zscript")
-            and name.lower().endswith((".zs", ".zsc", ".zscript", ".zc"))
-        ]
-
-        for entry_name in zscript_entries:
-            raw_bytes = zf.read(entry_name)
-            text = raw_bytes.decode("utf-8", errors="ignore")
-            # Формируем виртуальный URI вида zip:///C:/.../uzdoom.pk3/zscript/actors/actor.zs
-            virtual_uri = f"zip:///{pk3_path.as_posix().lstrip('/')}/{entry_name}"
-            index_source(uri=virtual_uri, source=text)
-
-
 def apply_settings(raw_settings: object, ls: LanguageServer) -> None:
     if not isinstance(raw_settings, dict):
         return
@@ -114,7 +68,7 @@ def apply_settings(raw_settings: object, ls: LanguageServer) -> None:
     for pk3 in pk3_list:
         if isinstance(pk3, str):
             try:
-                index_pk3(pk3)
+                index_manager.index_pk3(pk3)
                 loaded_count += 1
             except zipfile.BadZipfile as err:
                 ls.window_show_message(
@@ -161,10 +115,10 @@ def load_object_methods() -> None:
             types.CompletionItemKind.Property,
         ),
     ]
-    existing_obj = {m.orig_name.lower() for m in class_members.get("object", [])}
+    existing_obj = {m.orig_name.lower() for m in index_manager.class_members.get("object", [])}
     for m_name, m_sig, m_type, m_kind in builtin_object_methods:
         if m_name.lower() not in existing_obj:
-            class_members.setdefault("object", []).append(
+            index_manager.class_members.setdefault("object", []).append(
                 SymbolInfo(
                     orig_name=m_name,
                     kind=m_kind,
@@ -201,10 +155,10 @@ def register_builtin_zscript_members() -> None:
         owner="actor",
         type_name="actor",
     )
-    existing = [m.orig_name.lower() for m in class_members.get("actor", [])]
+    existing = [m.orig_name.lower() for m in index_manager.class_members.get("actor", [])]
     if "default" not in existing:
-        class_members.setdefault("actor", []).append(default_prop)
-        symbol_index.setdefault("default", []).append(default_prop)
+        index_manager.class_members.setdefault("actor", []).append(default_prop)
+        index_manager.symbol_index.setdefault("default", []).append(default_prop)
 
 
 def load_actors_builtin_actor_flags() -> None:
@@ -236,7 +190,7 @@ def load_actors_builtin_actor_flags() -> None:
                 owner="Actor",
                 type_name="bool",
             )
-            class_members.setdefault("actor", []).append(info)
+            index_manager.class_members.setdefault("actor", []).append(info)
 
 
 def build_semantic_tokens(source: str) -> list[int]:
@@ -335,7 +289,7 @@ def build_semantic_tokens(source: str) -> list[int]:
                 "member_access_expression",
             ):
                 ident_lower = node_text(node, source).lower()
-                entries = symbol_index.get(ident_lower)
+                entries = index_manager.get_symbol(ident_lower)
                 if entries:
                     kind = entries[0].kind
                     if kind == types.CompletionItemKind.Class:
@@ -373,24 +327,6 @@ def build_semantic_tokens(source: str) -> list[int]:
     return encoded
 
 
-def uri_to_path(uri: str) -> Path:
-    parsed = urlparse(uri)
-    path_str = unquote(parsed.path)
-    # Remove first slash symbol on Windows
-    if len(path_str) >= 3 and path_str[0] == "/" and path_str[2] == ":":
-        path_str = path_str[1:]
-    return Path(path_str)
-
-
-def node_to_range(node: Node) -> types.Range:
-    return types.Range(
-        start=types.Position(
-            line=node.start_point.row, character=node.start_point.column
-        ),
-        end=types.Position(line=node.end_point.row, character=node.end_point.column),
-    )
-
-
 def get_workspace_root_for_uri(ls: LanguageServer, uri: str) -> Path | None:
     file_path = uri_to_path(uri).resolve()
     for folder in ls.workspace.folders.values():
@@ -402,237 +338,9 @@ def get_workspace_root_for_uri(ls: LanguageServer, uri: str) -> Path | None:
     return file_path.parent
 
 
-def resolve_include_path(
-    root_path: Path | None, current_uri: str, inc_str: str
-) -> Path | None:
-    clean_rel = inc_str.strip('"').strip("'").replace("\\", "/").strip()
-    if not clean_rel:
-        return None
-
-    candidates: list[Path] = []
-
-    if root_path:
-        candidates.append((root_path / clean_rel).resolve())
-    if current_uri.startswith("file://"):
-        candidates.append((uri_to_path(current_uri).parent / clean_rel).resolve())
-
-    for cand in candidates:
-        if cand.is_file():
-            return cand
-    return None
-
-
-def find_owner_node(node: Node) -> tuple[str, str] | None:
-    """Returns (owner_type, original_owner_name) for a method or property."""
-    parent = node.parent
-    while parent:
-        if parent.type in ("class_definition", "struct_definition", "extend_class"):
-            kind = "class" if parent.type == "class_definition" else "struct"
-            name_node = parent.child_by_field_name("name")
-            if name_node and name_node.text:
-                return kind, name_node.text.decode("utf-8")
-        parent = parent.parent
-    return None
-
-
-def extract_signature(node: Node, source: str) -> str:
-    end_byte = node.end_byte
-    for child in node.children:
-        if child.type in ("block", ";"):
-            end_byte = child.start_byte
-            break
-
-    source_bytes = bytes(source, "utf-8")
-    sig = " ".join(
-        source_bytes[node.start_byte : end_byte]
-        .decode("utf-8", errors="ignore")
-        .split()
-    )
-
-    if node.type in ("method_declaration", "variable_declaration"):
-        sig += ";"
-        owner = find_owner_node(node)
-        if owner:
-            kind, owner_name = owner
-            return f"{kind} {owner_name} {{\n    {sig}\n}}"
-    return sig
-
-
-def clear_file_index(uri: str) -> None:
-    for name in file_symbols.get(uri, set()):
-        if name in symbol_index:
-            symbol_index[name] = [s for s in symbol_index[name] if s.uri != uri]
-            if not symbol_index[name]:
-                del symbol_index[name]
-    file_symbols[uri] = set()
-
-    for cls_name in file_classes.get(uri, set()):
-        if cls_name in class_members:
-            class_members[cls_name] = [
-                m for m in class_members[cls_name] if m.uri != uri
-            ]
-            if not class_members[cls_name]:
-                del class_members[cls_name]
-    file_classes[uri] = set()
-
-
-def index_source(
-    uri: str,
-    source: str,
-    workspace_root: Path | None = None,
-    visited_uris: set[str] | None = None,
-) -> list[types.Diagnostic]:
-    if visited_uris is None:
-        visited_uris = {uri}
-    else:
-        visited_uris.add(uri)
-
-    clear_file_index(uri)
-
-    tree = parser.parse(bytes(source, "utf-8"))
-    diagnostics: list[types.Diagnostic] = []
-
-    def add_symbol(
-        name_node: Node,
-        decl_node: Node,
-        kind: types.CompletionItemKind,
-    ) -> None:
-        orig_name = node_text(name_node, source)
-        key = orig_name.lower()
-        owner_info = find_owner_node(decl_node)
-        owner_name = owner_info[1] if owner_info else None
-        type_node = decl_node.child_by_field_name("type")
-        type_name = (
-            node_text(type_node, source).strip("@").lower() if type_node else None
-        )
-
-        info = SymbolInfo(
-            orig_name=orig_name,
-            kind=kind,
-            uri=uri,
-            location=types.Location(uri=uri, range=node_to_range(name_node)),
-            signature=extract_signature(decl_node, source),
-            owner=owner_name,
-            type_name=type_name,
-        )
-
-        symbol_index.setdefault(key, []).append(info)
-        file_symbols[uri].add(key)
-
-        if owner_name:
-            owner_key = owner_name.lower()
-            class_members.setdefault(owner_key, []).append(info)
-            file_classes[uri].add(owner_key)
-
-    def walk(node: Node) -> None:
-        if node.type == "ERROR" or node.is_missing:
-            diagnostics.append(
-                types.Diagnostic(
-                    range=node_to_range(node),
-                    message="ZScript syntax error",
-                    severity=types.DiagnosticSeverity.Error,
-                )
-            )
-        name_node = node.child_by_field_name("name")
-
-        if node.type == "include_definition":
-            path_node = node.child_by_field_name("path")
-            if path_node:
-                inc_text = node_text(path_node, source)
-                target_file = resolve_include_path(workspace_root, uri, inc_text)
-                if target_file:
-                    target_uri = target_file.as_uri()
-                    if target_uri not in visited_uris:
-                        try:
-                            inc_source = target_file.read_text(
-                                encoding="utf-8", errors="ignore"
-                            )
-                            index_source(
-                                target_uri, inc_source, workspace_root, visited_uris
-                            )
-                        except OSError:
-                            pass
-        elif node.type in ("const_definition", "const_array_definition"):
-            const_name = name_node
-            if not const_name:
-                for ch in node.children:
-                    if ch.type == "identifier":
-                        const_name = ch
-                        break
-                    if ch.type == "assignment_expression":
-                        left = ch.child_by_field_name("left")
-                        if left and left.type == "identifier":
-                            const_name = left
-                            break
-            if const_name:
-                add_symbol(const_name, node, types.CompletionItemKind.Constant)
-        elif node.type in ("flagdef_declaration"):
-            flag_node = name_node or node.child_by_field_name("flag")
-            if not flag_node:
-                # Берём первый identifier внутри flagdef (например, Solid из "flagdef Solid: flags, 0;")
-                flag_node = next(
-                    (ch for ch in node.children if ch.type == "identifier"), None
-                )
-            if flag_node:
-                raw_flag = node_text(flag_node, source)
-                full_flag = f"b{raw_flag}"
-                key = full_flag.lower()
-                owner_info = find_owner_node(node)
-                owner_name = owner_info[1] if owner_info else None
-                sig = extract_signature(node, source)
-
-                info = SymbolInfo(
-                    orig_name=full_flag,
-                    kind=types.CompletionItemKind.Property,
-                    uri=uri,
-                    location=types.Location(uri=uri, range=node_to_range(flag_node)),
-                    signature=sig,
-                    owner=owner_name,
-                    type_name="bool",
-                )
-                symbol_index.setdefault(key, []).append(info)
-                file_symbols[uri].add(key)
-
-                if owner_name:
-                    owner_key = owner_name.lower()
-                    class_members.setdefault(owner_key, []).append(info)
-                    file_classes[uri].add(owner_key)
-        elif name_node:
-            match node.type:
-                case "class_definition":
-                    inherit_node = node.child_by_field_name("inherit")
-                    if name_node and inherit_node and inherit_node.next_named_sibling:
-                        cls_key = node_text(name_node, source).lower()
-                        parent_node = inherit_node.next_named_sibling
-                        parent_key = node_text(parent_node, source).lower()
-                        class_parents[cls_key] = parent_key
-                    add_symbol(name_node, node, types.CompletionItemKind.Class)
-                case "struct_definition":
-                    add_symbol(name_node, node, types.CompletionItemKind.Struct)
-                case "enum_declaration":
-                    add_symbol(name_node, node, types.CompletionItemKind.Enum)
-                case "method_declaration":
-                    add_symbol(name_node, node, types.CompletionItemKind.Method)
-                case "variable_declaration":
-                    # index only class/struct fields, not local variables
-                    if find_owner_node(node):
-                        for child in node.children_by_field_name("name"):
-                            add_symbol(child, node, types.CompletionItemKind.Variable)
-                case "enum_declaration_value":
-                    add_symbol(name_node, node, types.CompletionItemKind.EnumMember)
-                case "state_label":
-                    add_symbol(name_node, node, types.CompletionItemKind.Event)
-
-        for child in node.children:
-            walk(child)
-
-    walk(tree.root_node)
-    return diagnostics
-
-
 def validate_and_index(ls: LanguageServer, uri: str, source: str) -> None:
     root = get_workspace_root_for_uri(ls, uri)
-    diagnostics = index_source(uri, source, workspace_root=root)
+    diagnostics = index_manager.index_source(uri, source, workspace_root=root)
     diagnostics.extend(check_undefined_identifiers(source))
     ls.text_document_publish_diagnostics(
         types.PublishDiagnosticsParams(uri=uri, diagnostics=diagnostics)
@@ -776,12 +484,12 @@ def get_members_with_inheritance(class_key: str) -> list[SymbolInfo]:
     curr = class_key.lower()
     while curr and curr not in visited_classes:
         visited_classes.add(curr)
-        for member in class_members.get(curr, []):
+        for member in index_manager.class_members.get(curr, []):
             m_key = member.orig_name.lower()
             if m_key not in seen_members:
                 seen_members.add(m_key)
                 result.append(member)
-        next_parent = class_parents.get(curr, "")
+        next_parent = index_manager.class_parents.get(curr, "")
         if not next_parent and curr != "object" and "object" not in visited_classes:
             next_parent = "object"
         curr = next_parent
@@ -811,9 +519,9 @@ def infer_rhs_type(
         ) or expr_node.children_by_field_name("target")
         for arg in args:
             raw = node_text(arg, source).strip("'").strip('"').lower()
-            if raw in class_members or raw in symbol_index:
+            if raw in index_manager.class_members or raw in index_manager.symbol_index:
                 return raw
-    elif fn_name in class_members or fn_name in symbol_index:
+    elif fn_name in index_manager.class_members or fn_name in index_manager.symbol_index:
         return fn_name
 
     # 2. Method Call: MyLibrary.GetInstance() или obj.GetItem()
@@ -857,8 +565,8 @@ def resolve_identifier_type(
 ) -> str | None:
     """Returns the name of the class/struct (in lowercase) for the identifier at the cursor position."""
     # 1. The identifier itself is a known class/struct (MyLibrary.)
-    if ident_lower in class_members or ident_lower in symbol_index:
-        for entry in symbol_index.get(ident_lower, []):
+    if ident_lower in index_manager.class_members or ident_lower in index_manager.symbol_index:
+        for entry in index_manager.get_symbol(ident_lower) or []:
             if entry.kind in (
                 types.CompletionItemKind.Class,
                 types.CompletionItemKind.Struct,
@@ -880,7 +588,7 @@ def resolve_identifier_type(
     if ident_lower == "self":
         return current_class
     if ident_lower == "super" and current_class:
-        return class_parents.get(current_class)
+        return index_manager.class_parents.get(current_class)
 
     # 3. Searching among the parameters and local variables of the current method
     if current_method:
@@ -957,7 +665,7 @@ def resolve_identifier_type(
                 method_text,
                 re.IGNORECASE,
             )
-            if m_decl and m_decl.group(1).lower() in class_members:
+            if m_decl and m_decl.group(1).lower() in index_manager.class_members:
                 return m_decl.group(1).lower()
 
         if local_type:
@@ -1083,17 +791,6 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
     tree = parser.parse(bytes(source, "utf-8"))
     extra_diagnostics: list[types.Diagnostic] = []
 
-    def is_known_class_or_struct(type_lower: str) -> bool:
-        if type_lower in class_members:
-            return True
-        for entry in symbol_index.get(type_lower, []):
-            if entry.kind in (
-                types.CompletionItemKind.Class,
-                types.CompletionItemKind.Struct,
-            ):
-                return True
-        return False
-
     def walk_tree(node: Node, current_class: str | None = None) -> None:
         if node.type in ("class_definition", "struct_definition"):
             name_node = node.child_by_field_name("name")
@@ -1113,7 +810,7 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
             base_scope: dict[str, str | None] = {
                 name: None for name in builtin_identifiers
             }
-            for sym_key, entries in symbol_index.items():
+            for sym_key, entries in index_manager.symbol_index.items():
                 first = entries[0]
                 if first.kind in (
                     types.CompletionItemKind.Class,
@@ -1125,7 +822,7 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
 
             if current_class:
                 base_scope["self"] = current_class
-                base_scope["super"] = class_parents.get(current_class)
+                base_scope["super"] = index_manager.class_parents.get(current_class)
                 for m in get_members_with_inheritance(current_class):
                     base_scope[m.orig_name.lower()] = m.type_name
 
@@ -1173,9 +870,9 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                                 raw = (
                                     node_text(arg, source).strip("'").strip('"').lower()
                                 )
-                                if is_known_class_or_struct(raw):
+                                if index_manager.is_known_class_or_struct(raw):
                                     return raw
-                        elif is_known_class_or_struct(fn_name):
+                        elif index_manager.is_known_class_or_struct(fn_name):
                             return fn_name
                         else:
                             _, ret_type = lookup_var(fn_name)
@@ -1325,7 +1022,7 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                         owner_type = resolve_node_type(obj_node)
                         if (
                             owner_type
-                            and is_known_class_or_struct(owner_type)
+                            and index_manager.is_known_class_or_struct(owner_type)
                             and target_mem.type == "identifier"
                         ):
                             orig_mem = node_text(target_mem, source)
@@ -1364,7 +1061,7 @@ def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
                             tail_mem = mem_node.child_by_field_name("member")
                             if (
                                 next_obj_type
-                                and is_known_class_or_struct(next_obj_type)
+                                and index_manager.is_known_class_or_struct(next_obj_type)
                                 and tail_mem
                                 and tail_mem.type == "identifier"
                             ):
@@ -1467,7 +1164,7 @@ def on_initialized(ls: LanguageServer, params: types.InitializedParams) -> None:
                 if entry_uri not in visited_uris:
                     try:
                         text = entry_file.read_text(encoding="utf-8", errors="ignore")
-                        index_source(
+                        index_manager.index_source(
                             uri=entry_uri,
                             source=text,
                             workspace_root=root_path,
@@ -1482,7 +1179,7 @@ def on_initialized(ls: LanguageServer, params: types.InitializedParams) -> None:
                 if file_uri not in visited_uris:
                     try:
                         text = file_path.read_text(encoding="utf-8", errors="ignore")
-                        index_source(
+                        index_manager.index_source(
                             uri=file_uri,
                             source=text,
                             workspace_root=root_path,
@@ -1552,7 +1249,7 @@ def completions(
             types.CompletionItemKind.Struct,
             types.CompletionItemKind.Enum,
         }
-        for entries in symbol_index.values():
+        for entries in index_manager.symbol_index.values():
             for entry in entries:
                 if entry.kind in allowed_global_kinds:
                     items.append(
@@ -1598,7 +1295,7 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> types.Hover | None:
     entries = (
         filtered_entries
         if filtered_entries is not None
-        else symbol_index.get(target_key)
+        else index_manager.get_symbol(target_key)
     )
     if not entries:
         return None
@@ -1729,7 +1426,7 @@ def goto_definition(
             return types.Location(uri=doc.uri, range=node_to_range(found_local))
 
     # 4. Переход к глобальным классам, структурам, полям и методам
-    entries = symbol_index.get(target_key)
+    entries = index_manager.get_symbol(target_key)
     if not entries:
         return None
     return [e.location for e in entries]
@@ -1759,4 +1456,5 @@ def did_change_configuration(
 
 
 if __name__ == "__main__":
+    index_manager = IndexManager(parser=parser)
     server.start_io()
