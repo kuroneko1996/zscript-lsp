@@ -88,12 +88,20 @@ class IndexManager:
                     del self.class_members[cls_name]
         self.file_classes[uri] = set()
 
-    def handle_include(self, target_uri: str, target_file: Path) -> None:
+    def handle_include(
+        self,
+        target_uri: str,
+        target_file: Path,
+        workspace_root: Path | None = None,
+        visited_uris: set[str] | None = None,
+    ) -> None:
         """Handles dependency resolution and recursive indexing."""
+        if visited_uris is not None and target_uri in visited_uris:
+            return
         if target_uri not in self.file_symbols:
             try:
                 inc_source = target_file.read_text(encoding="utf-8", errors="ignore")
-                self.index_source(target_uri, inc_source, None, None)
+                self.index_source(target_uri, inc_source, workspace_root, visited_uris)
             except OSError:
                 pass
 

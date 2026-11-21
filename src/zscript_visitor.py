@@ -307,7 +307,9 @@ class ZScriptVisitor:
             inc_text = node_text(path_node, source)
             target_file = resolve_include_path(workspace_root, uri, inc_text)
             if target_file:
-                self.manager.handle_include(target_file.as_uri(), target_file)
+                self.manager.handle_include(
+                    target_file.as_uri(), target_file, workspace_root
+                )
 
     def visit_generic(
         self,
