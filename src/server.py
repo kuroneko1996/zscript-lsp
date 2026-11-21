@@ -8,6 +8,7 @@ from pygls.lsp.server import LanguageServer
 from tree_sitter import Language, Node, Parser
 
 from index_manager import IndexManager
+from semantic_validator import SemanticValidator
 from symbol_info import SymbolInfo
 from utils import (
     node_text,
@@ -53,6 +54,7 @@ TOKEN_MODIFIERS = [
 ]
 
 TOKEN_TYPE_INDEX = {name: i for i, name in enumerate(TOKEN_TYPES)}
+
 
 def apply_settings(raw_settings: object, ls: LanguageServer) -> None:
     if not isinstance(raw_settings, dict):
@@ -115,7 +117,9 @@ def load_object_methods() -> None:
             types.CompletionItemKind.Property,
         ),
     ]
-    existing_obj = {m.orig_name.lower() for m in index_manager.class_members.get("object", [])}
+    existing_obj = {
+        m.orig_name.lower() for m in index_manager.class_members.get("object", [])
+    }
     for m_name, m_sig, m_type, m_kind in builtin_object_methods:
         if m_name.lower() not in existing_obj:
             index_manager.class_members.setdefault("object", []).append(
@@ -155,7 +159,9 @@ def register_builtin_zscript_members() -> None:
         owner="actor",
         type_name="actor",
     )
-    existing = [m.orig_name.lower() for m in index_manager.class_members.get("actor", [])]
+    existing = [
+        m.orig_name.lower() for m in index_manager.class_members.get("actor", [])
+    ]
     if "default" not in existing:
         index_manager.class_members.setdefault("actor", []).append(default_prop)
         index_manager.symbol_index.setdefault("default", []).append(default_prop)
@@ -341,7 +347,8 @@ def get_workspace_root_for_uri(ls: LanguageServer, uri: str) -> Path | None:
 def validate_and_index(ls: LanguageServer, uri: str, source: str) -> None:
     root = get_workspace_root_for_uri(ls, uri)
     diagnostics = index_manager.index_source(uri, source, workspace_root=root)
-    diagnostics.extend(check_undefined_identifiers(source))
+    validator = SemanticValidator(index_manager, builtin_identifiers)
+    diagnostics.extend(validator.validate(source))
     ls.text_document_publish_diagnostics(
         types.PublishDiagnosticsParams(uri=uri, diagnostics=diagnostics)
     )
@@ -521,7 +528,9 @@ def infer_rhs_type(
             raw = node_text(arg, source).strip("'").strip('"').lower()
             if raw in index_manager.class_members or raw in index_manager.symbol_index:
                 return raw
-    elif fn_name in index_manager.class_members or fn_name in index_manager.symbol_index:
+    elif (
+        fn_name in index_manager.class_members or fn_name in index_manager.symbol_index
+    ):
         return fn_name
 
     # 2. Method Call: MyLibrary.GetInstance() или obj.GetItem()
@@ -565,7 +574,10 @@ def resolve_identifier_type(
 ) -> str | None:
     """Returns the name of the class/struct (in lowercase) for the identifier at the cursor position."""
     # 1. The identifier itself is a known class/struct (MyLibrary.)
-    if ident_lower in index_manager.class_members or ident_lower in index_manager.symbol_index:
+    if (
+        ident_lower in index_manager.class_members
+        or ident_lower in index_manager.symbol_index
+    ):
         for entry in index_manager.get_symbol(ident_lower) or []:
             if entry.kind in (
                 types.CompletionItemKind.Class,
@@ -678,438 +690,6 @@ def resolve_identifier_type(
                 return member.type_name
 
     return None
-
-
-# region Declared Variables Check
-def collect_declared_names(method_node: Node, source: str) -> set[str]:
-    """Collects all parameters and local variables within a method."""
-    declared: set[str] = set()
-
-    # 1. Method parameters
-    param_list = next(
-        (c for c in method_node.children if c.type == "parameter_list"), None
-    )
-    if param_list:
-        for n_node in param_list.children_by_field_name("name"):
-            declared.add(node_text(n_node, source).lower())
-
-    # 2. Local variables (including let, for, and foreach)
-    def walk_decls(n: Node) -> None:
-        if n.type == "declaration_statement":
-            for child in n.children:
-                if child.type == "identifier":
-                    declared.add(node_text(child, source).lower())
-                elif child.type == "assignment_expression":
-                    left = child.child_by_field_name("left")
-                    if left and left.type == "identifier":
-                        declared.add(node_text(left, source).lower())
-
-        elif n.type == "foreach_statement":
-            for field_name in ("left", "value"):
-                f_node = n.child_by_field_name(field_name)
-                if f_node and f_node.type == "identifier":
-                    declared.add(node_text(f_node, source).lower())
-
-        for ch in n.children:
-            walk_decls(ch)
-
-    walk_decls(method_node)
-    return declared
-
-
-def is_ignored_identifier(node: Node) -> bool:
-    """Проверяет, является ли идентификатор именем типа, поля после точки или объявлением."""
-    parent = node.parent
-    if not parent:
-        return True
-
-    # Правая часть после точки: obj.member
-    if parent.type == "member_access_expression":
-        member_node = parent.child_by_field_name("member")
-        if member_node and member_node.id == node.id:
-            return True
-
-    # Объявления переменных, параметров, констант, типов, меток и спрайтов
-    if parent.type in (
-        "declaration_statement",
-        "parameter_list",
-        "class_type",
-        "const_definition",
-        "const_array_definition",
-        "enum_declaration",
-        "enum_declaration_value",
-        "state_label",
-        "frame_sprite",
-        "control_statement",
-    ):
-        return True
-
-    # Левая часть объявления с присваиванием: int a = 1; или let a = 1;
-    if (
-        parent.type == "assignment_expression"
-        and parent.parent
-        and parent.parent.type == "declaration_statement"
-    ):
-        left = parent.child_by_field_name("left")
-        if left and left.id == node.id:
-            return True
-
-    # Деструктурирующее объявление: let [a, b] = ...;
-    if (
-        parent.type == "array_expression"
-        and parent.parent
-        and parent.parent.type == "assignment_expression"
-        and parent.parent.parent
-        and parent.parent.parent.type == "declaration_statement"
-    ):
-        left = parent.parent.child_by_field_name("left")
-        if left and left.id == parent.id:
-            return True
-
-    # Переменные цикла foreach (t, score : list)
-    if parent.type == "foreach_statement":
-        left = parent.child_by_field_name("left")
-        val = parent.child_by_field_name("value")
-        if (left and left.id == node.id) or (val and val.id == node.id):
-            return True
-
-    # Именованный аргумент функции: func(force: true)
-    # ruff: disable[SIM103]
-    if (
-        parent.type
-        in ("function_expression", "argument_list", "_function_expression_argument")
-        and node.next_sibling
-        and node.next_sibling.type == ":"
-    ):
-        return True
-
-    return False
-
-
-def check_undefined_identifiers(source: str) -> list[types.Diagnostic]:
-    """Последовательно проверяет идентификаторы и члены классов после точки с учётом типов и областей видимости."""
-    tree = parser.parse(bytes(source, "utf-8"))
-    extra_diagnostics: list[types.Diagnostic] = []
-
-    def walk_tree(node: Node, current_class: str | None = None) -> None:
-        if node.type in ("class_definition", "struct_definition"):
-            name_node = node.child_by_field_name("name")
-            cls_name = (
-                node_text(name_node, source).lower() if name_node else current_class
-            )
-            for ch in node.children:
-                walk_tree(ch, cls_name)
-            return
-
-        if node.type == "method_declaration":
-            body = next((c for c in node.children if c.type == "block"), None)
-            if not body:
-                return
-
-            # Базовый scope: { "имя_в_нижнем_регистре": "тип_в_нижнем_регистре_или_None" }
-            base_scope: dict[str, str | None] = {
-                name: None for name in builtin_identifiers
-            }
-            for sym_key, entries in index_manager.symbol_index.items():
-                first = entries[0]
-                if first.kind in (
-                    types.CompletionItemKind.Class,
-                    types.CompletionItemKind.Struct,
-                ):
-                    base_scope[sym_key] = sym_key
-                else:
-                    base_scope[sym_key] = first.type_name
-
-            if current_class:
-                base_scope["self"] = current_class
-                base_scope["super"] = index_manager.class_parents.get(current_class)
-                for m in get_members_with_inheritance(current_class):
-                    base_scope[m.orig_name.lower()] = m.type_name
-
-            param_list = next(
-                (c for c in node.children if c.type == "parameter_list"), None
-            )
-            if param_list:
-                p_types = param_list.children_by_field_name("type")
-                p_names = param_list.children_by_field_name("name")
-                for t_node, n_node in zip(p_types, p_names):
-                    p_name = node_text(n_node, source).lower()
-                    p_type = node_text(t_node, source).strip("@").lower()
-                    base_scope[p_name] = p_type
-
-            scope_stack: list[dict[str, str | None]] = [base_scope]
-
-            def lookup_var(name_lower: str) -> tuple[bool, str | None]:
-                for scope in reversed(scope_stack):
-                    if name_lower in scope:
-                        return True, scope[name_lower]
-                return False, None
-
-            def resolve_node_type(expr: Node | None) -> str | None:
-                """Определяет тип выражения (идентификатора, вызова метода, поля или цепочки точек)."""
-                if not expr:
-                    return None
-
-                if expr.type == "identifier":
-                    _, var_type = lookup_var(node_text(expr, source).lower())
-                    return var_type
-
-                if expr.type in ("function_expression", "typecast_expression"):
-                    fn_node = expr.child_by_field_name(
-                        "function"
-                    ) or expr.child_by_field_name("type")
-                    if not fn_node:
-                        return None
-                    if fn_node.type == "identifier":
-                        fn_name = node_text(fn_node, source).lower()
-                        if fn_name == "new":
-                            args = expr.children_by_field_name(
-                                "argument"
-                            ) or expr.children_by_field_name("target")
-                            for arg in args:
-                                raw = (
-                                    node_text(arg, source).strip("'").strip('"').lower()
-                                )
-                                if index_manager.is_known_class_or_struct(raw):
-                                    return raw
-                        elif index_manager.is_known_class_or_struct(fn_name):
-                            return fn_name
-                        else:
-                            _, ret_type = lookup_var(fn_name)
-                            return ret_type
-                    elif fn_node.type == "member_access_expression":
-                        return resolve_node_type(fn_node)
-
-                if expr.type == "member_access_expression" and expr.children:
-                    obj_node = expr.children[0]
-                    mem_node = expr.child_by_field_name("member")
-                    owner_type = resolve_node_type(obj_node)
-                    if owner_type and mem_node:
-                        mem_name = node_text(mem_node, source).lower()
-                        if mem_name == "default":
-                            return owner_type
-                        for m in get_members_with_inheritance(owner_type):
-                            if m.orig_name.lower() == mem_name:
-                                return m.type_name
-
-                return None
-
-            def check_node(n: Node) -> None:
-                # 1. Вложенный блок { ... }
-                if n.type == "block":
-                    scope_stack.append({})
-                    for ch in n.children:
-                        check_node(ch)
-                    scope_stack.pop()
-                    return
-
-                # 2. Цикл for
-                if n.type == "for_statement":
-                    scope_stack.append({})
-                    for ch in n.children:
-                        check_node(ch)
-                    scope_stack.pop()
-                    return
-
-                # 3. Цикл foreach
-                if n.type == "foreach_statement":
-                    right_node = n.child_by_field_name("right")
-                    if right_node:
-                        check_node(right_node)
-
-                    scope_stack.append({})
-                    for field_name in ("left", "value"):
-                        f_node = n.child_by_field_name(field_name)
-                        if f_node and f_node.type == "identifier":
-                            scope_stack[-1][node_text(f_node, source).lower()] = None
-
-                    body_node = n.child_by_field_name("body")
-                    if body_node:
-                        check_node(body_node)
-                    scope_stack.pop()
-                    return
-
-                # 4. Объявление переменной (с явным типом или через let)
-                if n.type == "declaration_statement":
-                    t_node = n.child_by_field_name("type")
-                    explicit_type = (
-                        node_text(t_node, source).strip("@").lower() if t_node else None
-                    )
-                    for child in n.children:
-                        if child.type == "identifier":
-                            scope_stack[-1][node_text(child, source).lower()] = (
-                                explicit_type
-                            )
-                        elif child.type == "subscript_expression":
-                            arr_name = child.children[0] if child.children else None
-                            if arr_name and arr_name.type == "identifier":
-                                scope_stack[-1][node_text(arr_name, source).lower()] = (
-                                    explicit_type
-                                )
-                        elif child.type == "assignment_expression":
-                            right = child.child_by_field_name("right")
-                            if right:
-                                check_node(right)
-                            left = child.child_by_field_name("left")
-                            if left and left.type == "identifier":
-                                var_type = explicit_type or resolve_node_type(right)
-                                scope_stack[-1][node_text(left, source).lower()] = (
-                                    var_type
-                                )
-                            elif child.type == "assignment_expression":
-                                right = child.child_by_field_name("right")
-                                if right:
-                                    check_node(right)
-                                left = child.child_by_field_name("left")
-                                if left:
-                                    var_type = explicit_type or resolve_node_type(right)
-                                    if left.type == "identifier":
-                                        scope_stack[-1][
-                                            node_text(left, source).lower()
-                                        ] = var_type
-                                    elif left.type == "array_expression":
-                                        elems = [
-                                            el
-                                            for el in left.children
-                                            if el.type == "identifier"
-                                        ]
-                                        type_parts = (
-                                            [p.strip() for p in var_type.split(",")]
-                                            if var_type and "," in var_type
-                                            else []
-                                        )
-                                        for idx, el in enumerate(elems):
-                                            el_type = (
-                                                type_parts[idx]
-                                                if idx < len(type_parts)
-                                                else var_type
-                                            )
-                                            scope_stack[-1][
-                                                node_text(el, source).lower()
-                                            ] = el_type
-
-                    return
-
-                # 5. Локальная константа
-                if n.type in ("const_definition", "const_array_definition"):
-                    val_node = n.child_by_field_name("value") or n.child_by_field_name(
-                        "contents"
-                    )
-                    if val_node:
-                        check_node(val_node)
-                    name_node = n.child_by_field_name("name")
-                    t_node = n.child_by_field_name("type")
-                    c_type = (
-                        node_text(t_node, source).strip("@").lower() if t_node else None
-                    )
-                    if name_node:
-                        scope_stack[-1][node_text(name_node, source).lower()] = c_type
-                    return
-
-                # 6. Обращение через точку: obj.member
-                if n.type == "member_access_expression" and n.children:
-                    obj_node = n.children[0]
-                    check_node(obj_node)
-
-                    mem_node = n.child_by_field_name("member")
-                    if mem_node:
-                        target_mem = (
-                            mem_node.children[0]
-                            if mem_node.type == "member_access_expression"
-                            and mem_node.children
-                            else mem_node
-                        )
-                        owner_type = resolve_node_type(obj_node)
-                        if (
-                            owner_type
-                            and index_manager.is_known_class_or_struct(owner_type)
-                            and target_mem.type == "identifier"
-                        ):
-                            orig_mem = node_text(target_mem, source)
-                            mem_lower = orig_mem.lower()
-                            members = get_members_with_inheritance(owner_type)
-                            if not any(
-                                m.orig_name.lower() == mem_lower for m in members
-                            ):
-                                extra_diagnostics.append(
-                                    types.Diagnostic(
-                                        range=node_to_range(target_mem),
-                                        message=f"Unknown member '{orig_mem}' on type '{owner_type}'",
-                                        severity=types.DiagnosticSeverity.Error,
-                                    )
-                                )
-                                return
-
-                        # Если справа вложена ещё одна точка (например, owner.Default.Height) — проверяем хвост цепочки
-                        if mem_node.type == "member_access_expression":
-                            next_obj_type = (
-                                owner_type
-                                if target_mem.type == "identifier"
-                                and node_text(target_mem, source).lower() == "default"
-                                else next(
-                                    (
-                                        m.type_name
-                                        for m in get_members_with_inheritance(
-                                            owner_type or ""
-                                        )
-                                        if m.orig_name.lower()
-                                        == node_text(target_mem, source).lower()
-                                    ),
-                                    None,
-                                )
-                            )
-                            tail_mem = mem_node.child_by_field_name("member")
-                            if (
-                                next_obj_type
-                                and index_manager.is_known_class_or_struct(next_obj_type)
-                                and tail_mem
-                                and tail_mem.type == "identifier"
-                            ):
-                                tail_orig = node_text(tail_mem, source)
-                                tail_lower = tail_orig.lower()
-                                tail_members = get_members_with_inheritance(
-                                    next_obj_type
-                                )
-                                if not any(
-                                    m.orig_name.lower() == tail_lower
-                                    for m in tail_members
-                                ):
-                                    extra_diagnostics.append(
-                                        types.Diagnostic(
-                                            range=node_to_range(tail_mem),
-                                            message=f"Unknown member '{tail_orig}' on type '{next_obj_type}'",
-                                            severity=types.DiagnosticSeverity.Error,
-                                        )
-                                    )
-                    return
-
-                # 7. Обычный идентификатор
-                if n.type == "identifier" and not is_ignored_identifier(n):
-                    orig_text = node_text(n, source)
-                    found, _ = lookup_var(orig_text.lower())
-                    if not found:
-                        extra_diagnostics.append(
-                            types.Diagnostic(
-                                range=node_to_range(n),
-                                message=f"Unknown identifier '{orig_text}'",
-                                severity=types.DiagnosticSeverity.Error,
-                            )
-                        )
-
-                for ch in n.children:
-                    check_node(ch)
-
-            check_node(body)
-            return
-
-        for ch in node.children:
-            walk_tree(ch, current_class)
-
-    walk_tree(tree.root_node)
-    return extra_diagnostics
-
-
-# endregion
 
 
 @server.feature(types.INITIALIZE)
@@ -1267,7 +847,7 @@ def completions(
 @server.feature(types.TEXT_DOCUMENT_HOVER)
 def hover(ls: LanguageServer, params: types.HoverParams) -> types.Hover | None:
     doc = ls.workspace.get_text_document(params.text_document.uri)
-    tree = parser.parse(bytes(doc.source, "utf8"))
+    tree = parser.parse(bytes(doc.source, "utf-8"))
     point = (params.position.line, params.position.character)
     node = tree.root_node.descendant_for_point_range(point, point)
     if not node:
@@ -1275,23 +855,41 @@ def hover(ls: LanguageServer, params: types.HoverParams) -> types.Hover | None:
 
     target_key = node_text(node, doc.source).strip('"').strip("'").lower()
 
-    # Checking whether the word under the cursor is a class member following a dot (for example: MyLibrary.GetInstance)
     filtered_entries: list[SymbolInfo] | None = None
     parent = node.parent
-    if parent and parent.type == "member_access_expression":
-        member_node = parent.child_by_field_name("member")
-        if member_node and member_node.id == node.id and parent.children:
-            obj_node = parent.children[0]
-            obj_ident = node_text(obj_node, doc.source).lower()
-            resolved_owner = resolve_identifier_type(obj_ident, doc.source, point)
-            if resolved_owner:
-                # Search for a method/field only in the inheritanche chain of this class
-                members = get_members_with_inheritance(resolved_owner)
+
+    # 1. Вызов через точку: obj.Method() или ClassName.Method()
+    if (
+        parent
+        and parent.type == "member_access_expression"
+        and (member_node := parent.child_by_field_name("member"))
+        and member_node.id == node.id
+        and parent.children
+    ):
+        obj_node = parent.children[0]
+        obj_ident = node_text(obj_node, doc.source).lower()
+        resolved_owner = resolve_identifier_type(obj_ident, doc.source, point)
+        if resolved_owner:
+            members = get_members_with_inheritance(resolved_owner)
+            matched = [m for m in members if m.orig_name.lower() == target_key]
+            if matched:
+                filtered_entries = matched
+
+    # 2. Вызов без точки внутри класса: DrawBarKeys()
+    if filtered_entries is None:
+        _, owner_node = find_enclosing_by_line(tree.root_node, point[0])
+        if owner_node:
+            name_node = owner_node.child_by_field_name("name")
+            if name_node:
+                current_class = node_text(name_node, doc.source).lower()
+                # get_members_with_inheritance идёт от потомка к родителю,
+                # поэтому первый найденный элемент — это метод текущего класса
+                members = get_members_with_inheritance(current_class)
                 matched = [m for m in members if m.orig_name.lower() == target_key]
                 if matched:
-                    filtered_entries = matched
+                    filtered_entries = [matched[0]]
 
-    # If this is not a dot-notation call (or the type on the left could not be determined), retrieve it from the general index
+    # 3. Откат на глобальный индекс (имена классов, глобальные константы и т.д.)
     entries = (
         filtered_entries
         if filtered_entries is not None
