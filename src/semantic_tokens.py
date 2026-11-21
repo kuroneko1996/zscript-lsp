@@ -125,6 +125,7 @@ def build_semantic_tokens(parser: Parser, index_manager: IndexManager, source: s
                 "parameter_list",
                 "function_expression",
                 "member_access_expression",
+                "mixin_statement",
             ):
                 ident_lower = node_text(node, source).lower()
                 entries = index_manager.get_symbol(ident_lower)

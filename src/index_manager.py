@@ -22,6 +22,8 @@ class IndexManager:
         self.class_members: dict[str, list[SymbolInfo]] = {}
         # Inheritance {"child_class_lower_case": "parent_class_lower_case"}
         self.class_parents: dict[str, str] = {}
+        # Mixins {"target_class_lower_case": ["mixin_name_lower_case", ...]}
+        self.class_mixins: dict[str, list[str]] = {}
 
         # Links symbols to files for quick clearing or reindexing
         self.file_symbols: dict[str, set[str]] = {}
@@ -86,6 +88,9 @@ class IndexManager:
                 ]
                 if not self.class_members[cls_name]:
                     del self.class_members[cls_name]
+
+                self.class_mixins.pop(cls_name, None)
+
         self.file_classes[uri] = set()
 
     def handle_include(
@@ -175,11 +180,21 @@ class IndexManager:
         curr = class_key.lower()
         while curr and curr not in visited_classes:
             visited_classes.add(curr)
+            # 1. Собственные члены класса
             for member in self.class_members.get(curr, []):
                 m_key = member.orig_name.lower()
                 if m_key not in seen_members:
                     seen_members.add(m_key)
                     result.append(member)
+
+            # 2. Члены всех миксинов, подключённых к этому классу
+            for mixin_key in self.class_mixins.get(curr, []):
+                for member in self.class_members.get(mixin_key, []):
+                    m_key = member.orig_name.lower()
+                    if m_key not in seen_members:
+                        seen_members.add(m_key)
+                        result.append(member)
+
             next_parent = self.class_parents.get(curr, "")
             if not next_parent and curr != "object" and "object" not in visited_classes:
                 next_parent = "object"

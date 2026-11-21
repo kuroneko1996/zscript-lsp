@@ -294,6 +294,23 @@ class ZScriptVisitor:
         for child in node.children:
             self.generic_visit(child, source, uri, workspace_root, diagnostics)
 
+    def visit_mixin_statement(
+        self,
+        node: Node,
+        source: str,
+        uri: str,
+        workspace_root: Path | None,
+        diagnostics: list[types.Diagnostic],
+    ) -> None:
+        name_node = node.child_by_field_name("name")
+        owner_info = find_owner_node(node)
+        if name_node and owner_info:
+            owner_key = owner_info[1].lower()
+            mixin_key = node_text(name_node, source).lower()
+            mixins = self.manager.class_mixins.setdefault(owner_key, [])
+            if mixin_key not in mixins:
+                mixins.append(mixin_key)
+
     def visit_include_definition(
         self,
         node: Node,
